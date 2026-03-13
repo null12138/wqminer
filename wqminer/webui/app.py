@@ -854,12 +854,22 @@ def _simulate_in_batches(
     rows: List[Dict[str, Any]] = []
     index = 1
     batch_size = max(1, int(batch_size))
+    auth_lock = threading.Lock()
+    local = threading.local()
+
+    def get_client() -> WorldQuantBrainClient:
+        client = getattr(local, "client", None)
+        if client is None:
+            client = WorldQuantBrainClient(username=username, password=password)
+            with auth_lock:
+                client.authenticate()
+            local.client = client
+        return client
 
     def run_one(idx: int, expr: str) -> Dict[str, Any]:
         started = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
-            client = WorldQuantBrainClient(username=username, password=password)
-            client.authenticate()
+            client = get_client()
             result = client.simulate_expression(
                 expression=expr,
                 settings=settings,
@@ -879,16 +889,17 @@ def _simulate_in_batches(
         row["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         return row
 
-    for start in range(0, len(exprs), batch_size):
-        batch = exprs[start : start + batch_size]
-        with ThreadPoolExecutor(max_workers=min(concurrency, len(batch))) as executor:
+    max_workers = max(1, min(int(concurrency), len(exprs)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for start in range(0, len(exprs), batch_size):
+            batch = exprs[start : start + batch_size]
             futures = [executor.submit(run_one, index + i, expr) for i, expr in enumerate(batch)]
             for fut in as_completed(futures):
                 row = fut.result()
                 rows.append(row)
                 with out_jsonl.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-        index += len(batch)
+            index += len(batch)
 
     rows_sorted = sorted(rows, key=lambda x: int(x.get("index", 0)))
     if rows_sorted:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -36,12 +37,23 @@ def submit_expressions_concurrent(
     out_csv = out_root / f"submit_{ts}.csv"
     out_json = out_root / f"submit_{ts}.json"
 
+    auth_lock = threading.Lock()
+    local = threading.local()
+
+    def get_client() -> WorldQuantBrainClient:
+        client = getattr(local, "client", None)
+        if client is None:
+            client = WorldQuantBrainClient(username=username, password=password)
+            with auth_lock:
+                client.authenticate()
+            local.client = client
+        return client
+
     def run_one(index_expr):
         idx, expr = index_expr
         started = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
-            client = WorldQuantBrainClient(username=username, password=password)
-            client.authenticate()
+            client = get_client()
             result = client.simulate_expression(
                 expression=expr,
                 settings=settings,
@@ -103,4 +115,3 @@ def _unique(items: Sequence[str]) -> List[str]:
             seen.add(item)
             out.append(item)
     return out
-
