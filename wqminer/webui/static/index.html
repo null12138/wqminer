@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WQMiner WebUI</title>
+    <link rel="stylesheet" href="/ui/ui.css" />
+  </head>
+  <body>
+    <header>
+      <h1>WQMiner WebUI</h1>
+      <p>低占用的本地管理界面，分离字段拉取、模板生成与优化循环。</p>
+    </header>
+    <nav class="nav">
+      <a href="/ui/fields.html">字段拉取</a>
+      <a href="/ui/inspiration.html">灵感与模板</a>
+      <a href="/ui/optimize.html">提交-反馈-优化</a>
+      <a href="/ui/records.html">记录查看</a>
+      <a href="/ui/jobs.html">任务列表</a>
+    </nav>
+    <main class="container">
+      <section class="card">
+        <h2>工作流拆分</h2>
+        <p>每个功能都是独立任务：拉字段、生成模板、提交反馈优化。任务会在后台线程中运行，避免阻塞 UI。</p>
+      </section>
+      <section class="card">
+        <h2>低占用原则</h2>
+        <p>默认单线程任务队列，UI 仅轮询结果。可通过环境变量调整并发与端口。</p>
+      </section>
+      <section class="card">
+        <h2>一键自动优化</h2>
+        <p class="notice">流程：模板生成一次 → 覆盖字段回测 → 每轮基于上一轮数据单次进化 → 持续回测。</p>
+        <form class="job-form" data-job-type="auto_loop" data-status-target="auto-status" data-result-target="auto-result">
+          <div class="form-grid">
+            <div>
+              <label>LLM 配置文件</label>
+              <input name="llm_config" value="llm.json" />
+            </div>
+            <div>
+              <label>Credentials 文件路径</label>
+              <input name="credentials" value="credentials.json" />
+            </div>
+            <div>
+              <label>Region</label>
+              <input name="region" value="USA" />
+            </div>
+            <div>
+              <label>Universe</label>
+              <input name="universe" placeholder="TOP3000" />
+            </div>
+            <div>
+              <label>Delay</label>
+              <input name="delay" value="1" />
+            </div>
+            <div>
+              <label>模板数量</label>
+              <input name="count" value="24" />
+            </div>
+            <div>
+              <label>Sleep 秒数</label>
+              <input name="sleep_sec" value="60" />
+            </div>
+            <div>
+              <label>Max Cycles (0=无限)</label>
+              <input name="max_cycles" value="0" />
+            </div>
+            <div>
+              <label>Max Submissions/轮 (0=不限制)</label>
+              <input name="max_submissions" value="0" />
+            </div>
+            <div>
+              <label>并发</label>
+              <input name="concurrency" value="3" />
+            </div>
+            <div>
+              <label>批量大小(3条3条)</label>
+              <input name="batch_size" value="3" />
+            </div>
+            <div>
+              <label>单次回测最长等待(秒)</label>
+              <input name="max_wait_sec" value="240" />
+            </div>
+            <div>
+              <label>轮询间隔(秒)</label>
+              <input name="poll_interval_sec" value="5" />
+            </div>
+          </div>
+          <details style="margin-top:12px;">
+            <summary>高级参数</summary>
+            <div class="form-grid" style="margin-top:10px;">
+              <div>
+                <label>字段缓存文件</label>
+                <input name="fields_file" placeholder="data/cache/data_fields_USA_1_TOP3000.json" />
+              </div>
+              <div>
+                <label>语法手册路径</label>
+                <input name="syntax_manual_path" placeholder="docs/fast_expr_syntax_manual.json" />
+              </div>
+              <div>
+                <label>Style Prompt</label>
+                <input name="style_prompt" placeholder="prefer liquidity-aware mean reversion" />
+              </div>
+              <div>
+                <label>Inspiration Mode</label>
+                <select name="inspiration_mode">
+                  <option value="auto" selected>auto</option>
+                  <option value="manual">manual</option>
+                  <option value="none">none</option>
+                </select>
+              </div>
+              <div>
+                <label>覆盖全部字段</label>
+                <input name="cover_all_fields" type="checkbox" checked />
+              </div>
+              <div>
+                <label>覆盖字段上限 (0=全部)</label>
+                <input name="coverage_limit" value="0" />
+              </div>
+              <div>
+                <label>每轮字段批大小</label>
+                <input name="coverage_batch_size" value="200" />
+              </div>
+              <div>
+                <label>下一轮种子上限</label>
+                <input name="next_seed_limit" value="200" />
+              </div>
+              <div>
+                <label>Rounds</label>
+                <input name="rounds" value="3" />
+              </div>
+              <div>
+                <label>Variants Per Template</label>
+                <input name="variants_per_template" value="8" />
+              </div>
+              <div>
+                <label>Max Simulations (兼容旧字段)</label>
+                <input name="max_simulations" value="0" />
+              </div>
+              <div>
+                <label>Sharpe Threshold</label>
+                <input name="sharpe_threshold" value="1.25" />
+              </div>
+              <div>
+                <label>Fitness Threshold</label>
+                <input name="fitness_threshold" value="1.0" />
+              </div>
+              <div>
+                <label>输出目录</label>
+                <input name="output_dir" value="results/auto_runs" />
+              </div>
+              <div>
+                <label>Dry Run</label>
+                <input name="dry_run" type="checkbox" />
+              </div>
+            </div>
+            <div style="margin-top:12px;">
+              <label>手动灵感（仅 manual 模式）</label>
+              <textarea name="inspiration" placeholder="输入你的灵感，会覆盖自动生成。"></textarea>
+            </div>
+          </details>
+          <div class="inline">
+            <button type="submit">一键开始</button>
+          </div>
+        </form>
+        <div id="auto-status" class="status" style="margin-top:12px;"></div>
+        <div class="status" style="margin-top:10px;"><pre id="auto-result"></pre></div>
+        <p class="notice">如需停止任务，请到“任务列表”页面输入 Job ID 终止。</p>
+      </section>
+      <section class="card">
+        <h2>运行中的任务</h2>
+        <div class="status"><pre id="jobs-list"></pre></div>
+      </section>
+    </main>
+    <footer>
+      WQMiner WebUI · 本地访问推荐：127.0.0.1
+    </footer>
+    <script src="/ui/app.js?v=9"></script>
+  </body>
+</html>

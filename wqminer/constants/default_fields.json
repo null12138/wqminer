@@ -1,0 +1,11 @@
+[
+  {"id": "open", "description": "Open price"},
+  {"id": "high", "description": "High price"},
+  {"id": "low", "description": "Low price"},
+  {"id": "close", "description": "Close price"},
+  {"id": "vwap", "description": "Volume weighted average price"},
+  {"id": "returns", "description": "Daily return"},
+  {"id": "volume", "description": "Trading volume"},
+  {"id": "adv20", "description": "Average daily volume 20d"},
+  {"id": "cap", "description": "Market capitalization"}
+]

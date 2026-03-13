@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>灵感与模板</title>
+    <link rel="stylesheet" href="/ui/ui.css" />
+  </head>
+  <body>
+    <header>
+      <h1>灵感与模板</h1>
+      <p>输入灵感文本，引导 LLM 生成 FASTEXPR 模板。</p>
+    </header>
+    <nav class="nav">
+      <a href="/ui/index.html">首页</a>
+      <a href="/ui/fields.html">字段拉取</a>
+      <a href="/ui/optimize.html">提交-反馈-优化</a>
+      <a href="/ui/records.html">记录查看</a>
+      <a href="/ui/jobs.html">任务列表</a>
+    </nav>
+    <main class="container">
+      <section class="card">
+        <h2>灵感输入</h2>
+        <p class="notice">灵感会被追加到 style prompt，并记录到本地缓存。</p>
+        <form class="job-form" data-job-type="generate_templates" data-status-target="job-status" data-result-target="job-result">
+          <div class="form-grid">
+            <div>
+              <label>Region</label>
+              <input name="region" value="USA" />
+            </div>
+            <div>
+              <label>Universe</label>
+              <input name="universe" placeholder="TOP3000" />
+            </div>
+            <div>
+              <label>Delay</label>
+              <input name="delay" value="1" />
+            </div>
+            <div>
+              <label>LLM 配置文件</label>
+              <input name="llm_config" placeholder="llm.json" />
+            </div>
+            <div>
+              <label>字段缓存文件</label>
+              <input name="fields_file" placeholder="data/cache/data_fields_USA_1_TOP3000.json" />
+            </div>
+            <div>
+              <label>Credentials 文件路径</label>
+              <input name="credentials" placeholder="credentials.json" />
+            </div>
+            <div>
+              <label>模板数量</label>
+              <input name="count" value="24" />
+            </div>
+            <div>
+              <label>Style Prompt</label>
+              <input name="style_prompt" placeholder="prefer liquidity-aware mean reversion" />
+            </div>
+            <div>
+              <label>输出模板文件</label>
+              <input name="output" placeholder="templates/generated_templates.json" />
+            </div>
+          </div>
+          <div style="margin-top:12px;">
+            <label>灵感文本</label>
+            <textarea name="inspiration" placeholder="例如：结合情绪因子与成交量异动，偏中期均值回归..."></textarea>
+          </div>
+          <div class="inline">
+            <button type="submit">生成模板</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>迭代生成（带语法修复）</h2>
+        <form class="job-form" data-job-type="generate_templates_iter" data-status-target="iter-status" data-result-target="iter-result">
+          <div class="form-grid">
+            <div>
+              <label>Region</label>
+              <input name="region" value="USA" />
+            </div>
+            <div>
+              <label>Universe</label>
+              <input name="universe" placeholder="TOP3000" />
+            </div>
+            <div>
+              <label>Delay</label>
+              <input name="delay" value="1" />
+            </div>
+            <div>
+              <label>LLM 配置文件</label>
+              <input name="llm_config" placeholder="llm.json" />
+            </div>
+            <div>
+              <label>字段缓存文件</label>
+              <input name="fields_file" placeholder="data/cache/data_fields_USA_1_TOP3000.json" />
+            </div>
+            <div>
+              <label>Credentials 文件路径</label>
+              <input name="credentials" placeholder="credentials.json" />
+            </div>
+            <div>
+              <label>模板数量</label>
+              <input name="count" value="48" />
+            </div>
+            <div>
+              <label>迭代轮数</label>
+              <input name="rounds" value="3" />
+            </div>
+            <div>
+              <label>语法手册路径</label>
+              <input name="syntax_manual_path" placeholder="docs/fast_expr_syntax_manual.json" />
+            </div>
+            <div>
+              <label>输出模板文件</label>
+              <input name="output" placeholder="templates/generated_templates_iter.json" />
+            </div>
+            <div>
+              <label>报告输出</label>
+              <input name="report_output" placeholder="results/gen_templates_iter_report.json" />
+            </div>
+          </div>
+          <div style="margin-top:12px;">
+            <label>灵感文本</label>
+            <textarea name="inspiration" placeholder="例如：侧重质量因子+波动率过滤..."></textarea>
+          </div>
+          <div class="inline">
+            <button type="submit" class="secondary">迭代生成</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>历史灵感</h2>
+        <div class="status"><pre id="inspiration-list"></pre></div>
+      </section>
+
+      <section class="card">
+        <h2>任务状态</h2>
+        <div id="job-status" class="status"></div>
+        <div class="status" style="margin-top:10px;"><pre id="job-result"></pre></div>
+        <div id="iter-status" class="status" style="margin-top:10px;"></div>
+        <div class="status" style="margin-top:10px;"><pre id="iter-result"></pre></div>
+      </section>
+    </main>
+    <footer>
+      灵感会存储在 data/cache/inspirations.json。
+    </footer>
+    <script src="/ui/app.js?v=9"></script>
+  </body>
+</html>

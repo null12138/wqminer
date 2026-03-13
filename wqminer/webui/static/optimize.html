@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>提交-反馈-优化</title>
+    <link rel="stylesheet" href="/ui/ui.css" />
+  </head>
+  <body>
+    <header>
+      <h1>提交-反馈-优化</h1>
+      <p>独立进入仿真循环：提交表达式 → 反馈评分 → 变异优化。</p>
+    </header>
+    <nav class="nav">
+      <a href="/ui/index.html">首页</a>
+      <a href="/ui/fields.html">字段拉取</a>
+      <a href="/ui/inspiration.html">灵感与模板</a>
+      <a href="/ui/records.html">记录查看</a>
+      <a href="/ui/jobs.html">任务列表</a>
+    </nav>
+    <main class="container">
+      <section class="card">
+        <h2>优化任务</h2>
+        <form class="job-form" data-job-type="optimize_loop" data-status-target="job-status" data-result-target="job-result">
+          <div class="form-grid">
+            <div>
+              <label>Region</label>
+              <input name="region" value="USA" />
+            </div>
+            <div>
+              <label>Universe</label>
+              <input name="universe" placeholder="TOP3000" />
+            </div>
+            <div>
+              <label>Delay</label>
+              <input name="delay" value="1" />
+            </div>
+            <div>
+              <label>Neutralization</label>
+              <input name="neutralization" placeholder="INDUSTRY" />
+            </div>
+            <div>
+              <label>模板文件</label>
+              <input name="templates_file" placeholder="templates/generated_templates.json" />
+            </div>
+            <div>
+              <label>字段缓存文件</label>
+              <input name="fields_file" placeholder="data/cache/data_fields_USA_1_TOP3000.json" />
+            </div>
+            <div>
+              <label>Credentials 文件路径</label>
+              <input name="credentials" placeholder="credentials.json" />
+            </div>
+            <div>
+              <label>用户名</label>
+              <input name="username" placeholder="your_email" />
+            </div>
+            <div>
+              <label>密码</label>
+              <input name="password" type="password" />
+            </div>
+            <div>
+              <label>Rounds</label>
+              <input name="rounds" value="3" />
+            </div>
+            <div>
+              <label>Variants Per Template</label>
+              <input name="variants_per_template" value="8" />
+            </div>
+            <div>
+              <label>Max Simulations</label>
+              <input name="max_simulations" value="200" />
+            </div>
+            <div>
+              <label>Sharpe Threshold</label>
+              <input name="sharpe_threshold" value="1.25" />
+            </div>
+            <div>
+              <label>Fitness Threshold</label>
+              <input name="fitness_threshold" value="1.0" />
+            </div>
+            <div>
+              <label>输出目录</label>
+              <input name="output_dir" placeholder="results" />
+            </div>
+            <div>
+              <label>Dry Run</label>
+              <input name="dry_run" type="checkbox" />
+            </div>
+          </div>
+          <div style="margin-top:12px;">
+            <label>表达式列表（可选，优先于模板文件）</label>
+            <textarea name="expressions_text" placeholder="rank(ts_delta(close, 1))\nrank(ts_mean(volume, 20))"></textarea>
+          </div>
+          <div class="inline">
+            <button type="submit">启动优化循环</button>
+          </div>
+        </form>
+      </section>
+      <section class="card">
+        <h2>任务状态</h2>
+        <div id="job-status" class="status"></div>
+        <div class="status" style="margin-top:10px;"><pre id="job-result"></pre></div>
+      </section>
+    </main>
+    <footer>
+      Dry Run 会跳过真实 API 仿真，便于验证流程。
+    </footer>
+    <script src="/ui/app.js?v=9"></script>
+  </body>
+</html>

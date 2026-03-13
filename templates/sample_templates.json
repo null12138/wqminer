@@ -1,0 +1,6 @@
+{
+  "templates": [
+    {"expression": "ts_rank(ts_delta(close, 1), 20)"},
+    {"expression": "rank(volume / ts_mean(volume, 20))"}
+  ]
+}
