@@ -25,6 +25,9 @@ from ..storage import load_templates
 from ..models import SimulationResult, SimulationSettings
 from ..worldquant_client import WorldQuantBrainClient
 
+os.environ.setdefault("WQMINER_METADATA_MIN_INTERVAL", "0.4")
+os.environ.setdefault("WQMINER_METADATA_JITTER", "0.2")
+
 BASE_DIR = Path(__file__).resolve().parents[2]
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 

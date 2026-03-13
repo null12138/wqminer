@@ -2,6 +2,9 @@
 
 import json
 import logging
+import os
+import random
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -15,9 +18,22 @@ from .models import DataField, SimulationResult, SimulationSettings
 logger = logging.getLogger(__name__)
 
 
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        return default
+
+
 class WorldQuantBrainClient:
     BASE_URL = "https://api.worldquantbrain.com"
     PLATFORM_ALPHA_URL = "https://platform.worldquantbrain.com/alpha/"
+    _global_lock = threading.Lock()
+    _global_last_request_ts = 0.0
+    _global_last_meta_ts = 0.0
 
     def __init__(self, username: str, password: str, timeout_sec: int = 30):
         self.username = username
@@ -26,6 +42,28 @@ class WorldQuantBrainClient:
         self.sess = requests.Session()
         self.sess.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
         self.sess.auth = HTTPBasicAuth(username, password)
+        self.min_request_interval_sec = _env_float("WQMINER_MIN_REQUEST_INTERVAL", 0.0)
+        self.request_jitter_sec = _env_float("WQMINER_REQUEST_JITTER", 0.0)
+        self.metadata_min_interval_sec = _env_float("WQMINER_METADATA_MIN_INTERVAL", 0.0)
+        self.metadata_jitter_sec = _env_float("WQMINER_METADATA_JITTER", 0.0)
+
+    @classmethod
+    def _throttle(cls, min_interval_sec: float, jitter_sec: float, bucket: str) -> None:
+        if min_interval_sec <= 0:
+            return
+        with cls._global_lock:
+            now = time.monotonic()
+            last = cls._global_last_request_ts if bucket == "global" else cls._global_last_meta_ts
+            wait = min_interval_sec - (now - last)
+            if jitter_sec > 0:
+                wait += random.uniform(0.0, jitter_sec)
+            if wait > 0:
+                time.sleep(wait)
+                now = time.monotonic()
+            if bucket == "global":
+                cls._global_last_request_ts = now
+            else:
+                cls._global_last_meta_ts = now
 
     def authenticate(self, max_retries: int = 5) -> None:
         last_response = None
@@ -77,6 +115,11 @@ class WorldQuantBrainClient:
         last_response = None
 
         for attempt in range(1, max_retries + 1):
+            is_meta = any(token in url for token in ("/data-sets", "/data-fields", "/operators"))
+            if is_meta:
+                self._throttle(self.metadata_min_interval_sec, self.metadata_jitter_sec, "meta")
+            else:
+                self._throttle(self.min_request_interval_sec, self.request_jitter_sec, "global")
             response = self.sess.request(method, url, timeout=self.timeout_sec, **kwargs)
             last_response = response
 
