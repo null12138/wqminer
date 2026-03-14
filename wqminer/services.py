@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -166,6 +167,70 @@ def _build_evolution_hint(rows: Sequence[Dict[str, float]]) -> str:
         "and keeping turnover reasonable. Avoid duplicates.\n"
         + "\n".join(lines)
     )
+
+
+def _negate_expression(expr: str) -> str:
+    raw = (expr or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("-(") and raw.endswith(")"):
+        return raw[2:-1].strip()
+    if raw.startswith("-") and not raw.startswith("-("):
+        return raw[1:].strip()
+    return f"-({raw})"
+
+
+def _log_reverse_event(path: Path, row: Dict[str, float], negated: str) -> None:
+    if not path:
+        return
+    payload = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "expression": row.get("expression", ""),
+        "sharpe": float(row.get("sharpe", 0.0)),
+        "fitness": float(row.get("fitness", 0.0)),
+        "turnover": float(row.get("turnover", 0.0)),
+        "negated": negated,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _collect_reverse_candidates(
+    rows: Sequence[Dict[str, float]],
+    sharpe_max: float,
+    fitness_max: float,
+    log_path: Optional[Path],
+    seen: set,
+    max_count: int,
+) -> List[str]:
+    candidates: List[str] = []
+    if not rows:
+        return candidates
+    limit = int(max_count) if max_count is not None else 0
+    for row in rows:
+        try:
+            sharpe = float(row.get("sharpe", 0.0))
+            fitness = float(row.get("fitness", 0.0))
+        except Exception:
+            continue
+        if sharpe >= sharpe_max or fitness >= fitness_max:
+            continue
+        expr = str(row.get("expression", "")).strip()
+        if not expr:
+            continue
+        if expr.lstrip().startswith("-"):
+            continue
+        negated = _negate_expression(expr)
+        if not negated or negated in seen:
+            continue
+        seen.add(negated)
+        if log_path:
+            _log_reverse_event(log_path, row, negated)
+        candidates.append(negated)
+        if limit > 0 and len(candidates) >= limit:
+            break
+    return candidates
 
 
 def _summarize_results(rows: Sequence[Dict[str, float]]) -> Dict[str, float]:
@@ -413,6 +478,10 @@ def run_one_click(
     library_output: str = "",
     library_sharpe_min: float = 1.2,
     library_fitness_min: float = 1.0,
+    reverse_sharpe_max: float = -1.2,
+    reverse_fitness_max: float = -1.0,
+    reverse_log: str = "",
+    negate_max_per_round: int = 0,
 ) -> Dict:
     region = region.upper()
     universe = universe or get_default_universe(region)
@@ -474,6 +543,8 @@ def run_one_click(
     reflection = ""
     appended = 0
     results: List[Dict[str, float]] = []
+    negated_seen: set = set()
+    reverse_log_path = Path(reverse_log) if reverse_log else None
 
     try:
         while True:
@@ -492,6 +563,28 @@ def run_one_click(
                 max_wait_sec=max_wait_sec,
                 concurrency=concurrency,
             )
+            reverse_candidates = _collect_reverse_candidates(
+                results,
+                sharpe_max=reverse_sharpe_max,
+                fitness_max=reverse_fitness_max,
+                log_path=reverse_log_path,
+                seen=negated_seen,
+                max_count=negate_max_per_round,
+            )
+            if reverse_candidates:
+                logging.info("Reverse factors detected: %d, evaluating negated expressions", len(reverse_candidates))
+                negated_results = _evaluate_expressions(
+                    username=user,
+                    password=pwd,
+                    timeout_sec=timeout_sec,
+                    max_retries=max_retries,
+                    expressions=reverse_candidates,
+                    settings=settings,
+                    poll_interval_sec=poll_interval_sec,
+                    max_wait_sec=max_wait_sec,
+                    concurrency=concurrency,
+                )
+                results.extend(negated_results)
             files.append(_write_results_json(out_root / f"one_click_{ts}_round{round_idx:03}.json", results))
             appended += _append_library(library_output, results, library_sharpe_min, library_fitness_min)
 

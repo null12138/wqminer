@@ -55,6 +55,10 @@ def main() -> int:
         library_output=_get(cfg, "library_output", ""),
         library_sharpe_min=float(_get(cfg, "library_sharpe_min", 1.2)),
         library_fitness_min=float(_get(cfg, "library_fitness_min", 1.0)),
+        reverse_sharpe_max=float(_get(cfg, "reverse_sharpe_max", -1.2)),
+        reverse_fitness_max=float(_get(cfg, "reverse_fitness_max", -1.0)),
+        reverse_log=_get(cfg, "reverse_log", ""),
+        negate_max_per_round=int(_get(cfg, "negate_max_per_round", 0)),
     )
 
     for path in summary.get("files", []):

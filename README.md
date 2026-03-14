@@ -7,6 +7,7 @@ Core flow only:
 - Reflection after every round (LLM)
 - Optional evolution rounds
 - Auto-append strong results to template library
+- Reverse factor detection + negated retry
 - Infinite loop by default (stop with Ctrl+C)
 
 ## Files you use
@@ -32,6 +33,9 @@ python3 run.py --config run_config.json
 - `max_retries`: request retries for transient errors (default 8)
 - `max_rounds`: 0 = infinite
 - `sleep_between_rounds`: pause between rounds (seconds)
+- `reverse_sharpe_max`: trigger reverse when sharpe is below this (default -1.2)
+- `reverse_fitness_max`: trigger reverse when fitness is below this (default -1.0)
+- `negate_max_per_round`: cap negated retries per round (0 = unlimited)
 
 ## Auto-append to library
 Results with `sharpe >= 1.2` and `fitness >= 1.0` are appended to `templates/library.json` (deduped).
@@ -55,4 +59,17 @@ Every file is a list of rows with only these fields:
 [
   {"expression": "rank(close)", "sharpe": 1.12, "fitness": 0.34, "turnover": 12.5}
 ]
+```
+Reverse detections are logged to `results/one_click/reverse_flags.jsonl` when enabled.
+
+## Web query (history + query)
+Run a simple local web page:
+```bash
+python3 web_query.py --results-dir results/one_click --library templates/library.json
+```
+Then open `http://localhost:8002` in your browser.
+
+One-click script:
+```bash
+bash start_web.sh
 ```

@@ -10,5 +10,9 @@
   "rank(ts_stddev(returns, 20))",
   "rank(ts_decay_linear(returns, 10))",
   "rank(ts_corr(close, volume, 20))",
-  "rank(ts_covariance(close, volume, 20))"
+  "rank(ts_covariance(close, volume, 20))",
+  "-days_from_last_change(rp_ess_insider)",
+  "ts_mean(ts_rank(divide(sedol, ts_mean(sedol, 20)), 10), 60)",
+  "-ts_mean(ts_rank(sedol, 20), 60)",
+  "rank(-ts_backfill(zscore(goodwill/sales), 65) * (rank(fn_accrued_liab_a) + rank(capex) + rank(dividend / sharesout) + rank(debt_st)))"
 ]
