@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument("--field-max-pages", type=int, default=5)
     parser.add_argument("--min-interval", type=float, default=0.4, help="Minimum seconds between requests")
     parser.add_argument("--jitter", type=float, default=0.2, help="Random jitter seconds")
-    parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--output", default="", help="Output fields JSON path")
     parser.add_argument("--dataset-output", default="", help="Output datasets JSON path")
     return parser.parse_args()
@@ -78,11 +78,23 @@ def main() -> int:
     sess.auth = HTTPBasicAuth(username, password)
 
     last_request_ts = 0.0
+    cooldown_until = 0.0
+    min_interval_floor = float(args.min_interval)
+    rate_limit_hits = 0
+    rate_limit_window_start = 0.0
 
     def throttle():
-        nonlocal last_request_ts
+        nonlocal last_request_ts, cooldown_until, min_interval_floor, rate_limit_hits, rate_limit_window_start
         now = time.monotonic()
-        wait = args.min_interval - (now - last_request_ts)
+        if rate_limit_window_start and now - rate_limit_window_start > 120:
+            min_interval_floor = max(0.0, min_interval_floor * 0.5)
+            rate_limit_window_start = now
+            rate_limit_hits = 0
+
+        interval = max(float(args.min_interval), float(min_interval_floor))
+        wait = interval - (now - last_request_ts) if interval > 0 else 0.0
+        if cooldown_until > now:
+            wait = max(wait, cooldown_until - now)
         if args.jitter > 0:
             wait += random.uniform(0.0, args.jitter)
         if wait > 0:
@@ -104,11 +116,21 @@ def main() -> int:
             raise RuntimeError(f"Authentication failed: {response.status_code} {response.text}")
 
     def sleep_with_retry_after(response: requests.Response, attempt: int) -> None:
+        nonlocal cooldown_until, min_interval_floor, rate_limit_hits, rate_limit_window_start
         retry_after = response.headers.get("Retry-After")
         if retry_after and retry_after.isdigit():
             sec = max(1, int(retry_after))
         else:
             sec = min(30, 2 ** (attempt - 1))
+        now = time.monotonic()
+        cooldown_until = max(cooldown_until, now + sec)
+        if rate_limit_window_start == 0.0 or now - rate_limit_window_start > 60:
+            rate_limit_window_start = now
+            rate_limit_hits = 0
+        rate_limit_hits += 1
+        floor = max(1.0, min(6.0, sec * (1.0 + 0.5 * rate_limit_hits)))
+        if floor > min_interval_floor:
+            min_interval_floor = floor
         time.sleep(sec)
 
     def request(method: str, path: str, max_retries: int = 5, **kwargs) -> requests.Response:
@@ -116,7 +138,14 @@ def main() -> int:
         last = None
         for attempt in range(1, max_retries + 1):
             throttle()
-            response = sess.request(method, url, timeout=args.timeout, **kwargs)
+            try:
+                response = sess.request(method, url, timeout=args.timeout, **kwargs)
+            except requests.RequestException as exc:
+                if attempt < max_retries:
+                    sec = min(30, 2 ** (attempt - 1))
+                    time.sleep(sec)
+                    continue
+                raise RuntimeError(f"Request failed: {exc}") from exc
             last = response
             if response.status_code == 401 and attempt < max_retries:
                 authenticate()

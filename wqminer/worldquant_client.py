@@ -106,11 +106,19 @@ class WorldQuantBrainClient:
     def authenticate(self, max_retries: int = 5) -> None:
         last_response = None
         for attempt in range(1, max_retries + 1):
-            response = self.sess.post(
-                f"{self.base_url}/authentication",
-                auth=HTTPBasicAuth(self.username, self.password),
-                timeout=self.timeout_sec,
-            )
+            try:
+                response = self.sess.post(
+                    f"{self.base_url}/authentication",
+                    auth=HTTPBasicAuth(self.username, self.password),
+                    timeout=self.timeout_sec,
+                )
+            except requests.RequestException as exc:
+                if attempt < max_retries:
+                    sleep_sec = min(30, 2 ** (attempt - 1))
+                    logger.warning("Auth request error (%s), retrying in %ss", exc, sleep_sec)
+                    time.sleep(sleep_sec)
+                    continue
+                raise RuntimeError(f"Authentication failed: {exc}") from exc
             last_response = response
 
             if response.status_code in (200, 201):
@@ -160,7 +168,15 @@ class WorldQuantBrainClient:
                 self._throttle(self.metadata_min_interval_sec, self.metadata_jitter_sec, "meta")
             else:
                 self._throttle(self.min_request_interval_sec, self.request_jitter_sec, "global")
-            response = self.sess.request(method, url, timeout=self.timeout_sec, **kwargs)
+            try:
+                response = self.sess.request(method, url, timeout=self.timeout_sec, **kwargs)
+            except requests.RequestException as exc:
+                if attempt < max_retries:
+                    sleep_sec = min(30, 2 ** (attempt - 1))
+                    logger.warning("Request error on %s %s (%s), retry in %ss", method, url, exc, sleep_sec)
+                    time.sleep(sleep_sec)
+                    continue
+                raise RuntimeError(f"Request failed: {method} {url} {exc}") from exc
             last_response = response
 
             if response.status_code == 401 and retry_auth and attempt < max_retries:

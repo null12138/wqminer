@@ -4,8 +4,10 @@ Core flow only:
 - Inspiration generation (LLM)
 - FASTEXPR template generation
 - Simulation and scoring
+- Reflection after every round (LLM)
 - Optional evolution rounds
 - Auto-append strong results to template library
+- Infinite loop by default (stop with Ctrl+C)
 
 ## Files you use
 - `run.py` (main entry, no `-m`)
@@ -23,6 +25,13 @@ Then run:
 python3 run.py --config run_config.json
 ```
 
+## Key config knobs
+- `concurrency`: number of parallel simulations (default 3)
+- `poll_interval`: seconds between status polls (default 30)
+- `timeout_sec`: HTTP timeout per request (default 60)
+- `max_rounds`: 0 = infinite
+- `sleep_between_rounds`: pause between rounds (seconds)
+
 ## Auto-append to library
 Results with `sharpe >= 1.2` and `fitness >= 1.0` are appended to `templates/library.json` (deduped).
 Adjust thresholds in `run_config.json`:
@@ -39,7 +48,7 @@ python3 fetch_fields.py --credentials credentials.json --region USA --delay 1
 This script paginates datasets and fields, and backs off on 429.
 
 ## Output
-Each run writes JSON files into `results/one_click/`.
+Each round writes JSON into `results/one_click/`.
 Every file is a list of rows with only these fields:
 ```json
 [

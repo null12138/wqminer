@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -166,6 +168,71 @@ def _build_evolution_hint(rows: Sequence[Dict[str, float]]) -> str:
     )
 
 
+def _summarize_results(rows: Sequence[Dict[str, float]]) -> Dict[str, float]:
+    total = len(rows)
+    if total == 0:
+        return {"total": 0, "avg_sharpe": 0.0, "avg_fitness": 0.0, "avg_turnover": 0.0}
+    avg_sharpe = sum(float(r.get("sharpe", 0.0)) for r in rows) / total
+    avg_fitness = sum(float(r.get("fitness", 0.0)) for r in rows) / total
+    avg_turnover = sum(float(r.get("turnover", 0.0)) for r in rows) / total
+    return {
+        "total": total,
+        "avg_sharpe": avg_sharpe,
+        "avg_fitness": avg_fitness,
+        "avg_turnover": avg_turnover,
+    }
+
+
+def generate_reflection_text(
+    llm_config_path: str,
+    region: str,
+    universe: str,
+    delay: int,
+    round_index: int,
+    rows: Sequence[Dict[str, float]],
+    max_chars: int = 500,
+) -> str:
+    if not rows:
+        return ""
+    llm = OpenAICompatibleLLM(load_llm_config(llm_config_path))
+    summary = _summarize_results(rows)
+    top_rows = _select_top_rows(rows, 5)
+    lines = []
+    for row in top_rows:
+        expr = str(row.get("expression", "")).strip()
+        if not expr:
+            continue
+        lines.append(
+            f"- {expr} | sharpe={row.get('sharpe', 0.0):.3f}, "
+            f"fitness={row.get('fitness', 0.0):.3f}, turnover={row.get('turnover', 0.0):.2f}"
+        )
+
+    system_prompt = (
+        "You are a quantitative alpha researcher. "
+        "Provide a brief reflection and next-step guidance. "
+        "No chain-of-thought. Keep it under 3 sentences."
+    )
+    user_prompt = (
+        f"Round: {round_index}\n"
+        f"Region: {region}\n"
+        f"Universe: {universe}\n"
+        f"Delay: {delay}\n"
+        f"Total: {summary['total']}\n"
+        f"Avg sharpe: {summary['avg_sharpe']:.3f}\n"
+        f"Avg fitness: {summary['avg_fitness']:.3f}\n"
+        f"Avg turnover: {summary['avg_turnover']:.2f}\n"
+        "Top expressions:\n"
+        + ("\n".join(lines) if lines else "none")
+        + "\n\nReturn a short reflection and next guidance."
+    )
+
+    raw = llm.generate(system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.4)
+    cleaned = _clean_inspiration_text(raw)
+    if max_chars > 0 and len(cleaned) > max_chars:
+        return cleaned[:max_chars].rstrip()
+    return cleaned
+
+
 def _generate_expressions(
     generator: TemplateGenerator,
     region: str,
@@ -184,17 +251,35 @@ def _generate_expressions(
 
 
 def _evaluate_expressions(
-    client: WorldQuantBrainClient,
+    username: str,
+    password: str,
+    timeout_sec: int,
     expressions: Sequence[str],
     settings: SimulationSettings,
     poll_interval_sec: int,
     max_wait_sec: int,
+    concurrency: int,
 ) -> List[Dict[str, float]]:
     results: List[Dict[str, float]] = []
     total = len(expressions)
-    for idx, expr in enumerate(expressions, start=1):
+    if total == 0:
+        return results
+
+    auth_lock = threading.Lock()
+    local = threading.local()
+
+    def get_client() -> WorldQuantBrainClient:
+        client = getattr(local, "client", None)
+        if client is None:
+            client = WorldQuantBrainClient(username=username, password=password, timeout_sec=max(5, int(timeout_sec)))
+            with auth_lock:
+                client.authenticate()
+            local.client = client
+        return client
+
+    def run_one(idx: int, expr: str) -> Dict[str, float]:
         try:
-            result = client.simulate_expression(
+            result = get_client().simulate_expression(
                 expression=expr,
                 settings=settings,
                 poll_interval_sec=max(1, int(poll_interval_sec)),
@@ -212,17 +297,31 @@ def _evaluate_expressions(
         except Exception as exc:
             logging.warning("Simulation failed (%s/%s): %s", idx, total, exc)
             row = {"expression": expr, "sharpe": 0.0, "fitness": 0.0, "turnover": 0.0}
+        row["index"] = idx
+        return row
 
-        results.append(row)
+    max_workers = max(1, min(int(concurrency), total))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(run_one, idx, expr)
+            for idx, expr in enumerate(expressions, start=1)
+        ]
+        for fut in as_completed(futures):
+            results.append(fut.result())
+
+    results_sorted = sorted(results, key=lambda x: int(x.get("index", 0)))
+    for row in results_sorted:
         logging.info(
             "Simulated %s/%s sharpe=%.3f fitness=%.3f turnover=%.2f",
-            idx,
+            row.get("index", 0),
             total,
-            row["sharpe"],
-            row["fitness"],
-            row["turnover"],
+            row.get("sharpe", 0.0),
+            row.get("fitness", 0.0),
+            row.get("turnover", 0.0),
         )
-    return results
+        row.pop("index", None)
+
+    return results_sorted
 
 
 def _write_results_json(path: Path, rows: Sequence[Dict[str, float]]) -> str:
@@ -294,8 +393,12 @@ def run_one_click(
     style_prompt: str = "",
     inspiration: str = "",
     output_dir: str = "results/one_click",
+    concurrency: int = 3,
+    timeout_sec: int = 60,
     poll_interval_sec: int = 30,
     max_wait_sec: int = 600,
+    max_rounds: int = 0,
+    sleep_between_rounds: int = 5,
     evolve_rounds: int = 0,
     evolve_count: int = 0,
     evolve_top_k: int = 6,
@@ -310,7 +413,7 @@ def run_one_click(
 
     user, pwd = resolve_credentials(credentials_path, username, password, required=True)
 
-    client = WorldQuantBrainClient(username=user, password=pwd)
+    client = WorldQuantBrainClient(username=user, password=pwd, timeout_sec=max(5, int(timeout_sec)))
     client.authenticate()
 
     fields_cache = default_fields_cache_path(region, universe, delay)
@@ -351,24 +454,51 @@ def run_one_click(
         neutralization=neutralization,
     )
 
-    expressions = _generate_expressions(generator, region, fields, template_count, base_style)
-    results = _evaluate_expressions(client, expressions, settings, poll_interval_sec, max_wait_sec)
-    files.append(_write_results_json(out_root / f"one_click_{ts}_gen0.json", results))
-    appended = _append_library(library_output, results, library_sharpe_min, library_fitness_min)
+    round_limit = max(0, int(max_rounds))
+    if round_limit <= 0 and int(evolve_rounds) > 0:
+        round_limit = int(evolve_rounds)
 
-    rounds = max(0, int(evolve_rounds))
-    if rounds > 0:
-        per_round = evolve_count if evolve_count and int(evolve_count) > 0 else template_count
-        for round_idx in range(1, rounds + 1):
-            top_rows = _select_top_rows(results, evolve_top_k)
-            evolution_hint = _build_evolution_hint(top_rows)
-            if not evolution_hint:
-                break
-            style = merge_style_prompt(base_style, evolution_hint)
+    round_idx = 0
+    reflection = ""
+    appended = 0
+    results: List[Dict[str, float]] = []
+
+    try:
+        while True:
+            round_idx += 1
+            per_round = evolve_count if evolve_count and int(evolve_count) > 0 else template_count
+            style = base_style if not reflection else merge_style_prompt(base_style, reflection)
             expressions = _generate_expressions(generator, region, fields, per_round, style)
-            results = _evaluate_expressions(client, expressions, settings, poll_interval_sec, max_wait_sec)
-            files.append(_write_results_json(out_root / f"one_click_{ts}_gen{round_idx}.json", results))
+            results = _evaluate_expressions(
+                username=user,
+                password=pwd,
+                timeout_sec=timeout_sec,
+                expressions=expressions,
+                settings=settings,
+                poll_interval_sec=poll_interval_sec,
+                max_wait_sec=max_wait_sec,
+                concurrency=concurrency,
+            )
+            files.append(_write_results_json(out_root / f"one_click_{ts}_round{round_idx:03}.json", results))
             appended += _append_library(library_output, results, library_sharpe_min, library_fitness_min)
+
+            reflection = generate_reflection_text(
+                llm_config_path=llm_config_path,
+                region=region,
+                universe=universe,
+                delay=delay,
+                round_index=round_idx,
+                rows=results,
+            )
+            if reflection:
+                logging.info("Reflection (round %s): %s", round_idx, reflection)
+
+            if round_limit > 0 and round_idx >= round_limit:
+                break
+            if sleep_between_rounds and int(sleep_between_rounds) > 0:
+                time.sleep(int(sleep_between_rounds))
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user, stopping after round %s", round_idx)
 
     return {
         "files": files,
