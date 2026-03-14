@@ -34,11 +34,17 @@ class WorldQuantBrainClient:
     _global_lock = threading.Lock()
     _global_last_request_ts = 0.0
     _global_last_meta_ts = 0.0
+    _global_cooldown_until = 0.0
+    _global_min_interval_floor = 0.0
+    _global_last_rate_limit_ts = 0.0
+    _global_rate_limit_hits = 0
+    _global_rate_limit_window_start = 0.0
 
-    def __init__(self, username: str, password: str, timeout_sec: int = 30):
+    def __init__(self, username: str, password: str, timeout_sec: int = 30, base_url: Optional[str] = None):
         self.username = username
         self.password = password
         self.timeout_sec = timeout_sec
+        self.base_url = (base_url or self.BASE_URL).rstrip("/")
         self.sess = requests.Session()
         self.sess.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
         self.sess.auth = HTTPBasicAuth(username, password)
@@ -49,14 +55,21 @@ class WorldQuantBrainClient:
 
     @classmethod
     def _throttle(cls, min_interval_sec: float, jitter_sec: float, bucket: str) -> None:
-        if min_interval_sec <= 0:
-            return
         with cls._global_lock:
             now = time.monotonic()
+            if cls._global_last_rate_limit_ts and cls._global_min_interval_floor > 0:
+                if now - cls._global_last_rate_limit_ts > 120:
+                    cls._global_min_interval_floor = max(0.0, cls._global_min_interval_floor * 0.5)
+                    cls._global_last_rate_limit_ts = now
             last = cls._global_last_request_ts if bucket == "global" else cls._global_last_meta_ts
-            wait = min_interval_sec - (now - last)
+            interval = max(min_interval_sec, cls._global_min_interval_floor)
+            wait = interval - (now - last) if interval > 0 else 0.0
+            if cls._global_cooldown_until > now:
+                wait = max(wait, cls._global_cooldown_until - now)
             if jitter_sec > 0:
                 wait += random.uniform(0.0, jitter_sec)
+            elif interval > 0 and cls._global_min_interval_floor > 0:
+                wait += random.uniform(0.0, min(0.2, interval * 0.2))
             if wait > 0:
                 time.sleep(wait)
                 now = time.monotonic()
@@ -65,11 +78,36 @@ class WorldQuantBrainClient:
             else:
                 cls._global_last_meta_ts = now
 
+    @classmethod
+    def _note_rate_limit(cls, sleep_sec: float) -> None:
+        if sleep_sec <= 0:
+            return
+        now = time.monotonic()
+        with cls._global_lock:
+            if cls._global_rate_limit_window_start == 0.0 or now - cls._global_rate_limit_window_start > 60:
+                cls._global_rate_limit_window_start = now
+                cls._global_rate_limit_hits = 0
+            cls._global_rate_limit_hits += 1
+
+            until = now + sleep_sec
+            if until > cls._global_cooldown_until:
+                cls._global_cooldown_until = until
+
+            base = max(1.0, float(sleep_sec))
+            mult = 1.0 + min(6.0, cls._global_rate_limit_hits * 0.5)
+            max_floor = max(6.0, base)
+            floor = min(max_floor, base * mult)
+            if floor < base:
+                floor = base
+            if floor > cls._global_min_interval_floor:
+                cls._global_min_interval_floor = floor
+            cls._global_last_rate_limit_ts = now
+
     def authenticate(self, max_retries: int = 5) -> None:
         last_response = None
         for attempt in range(1, max_retries + 1):
             response = self.sess.post(
-                f"{self.BASE_URL}/authentication",
+                f"{self.base_url}/authentication",
                 auth=HTTPBasicAuth(self.username, self.password),
                 timeout=self.timeout_sec,
             )
@@ -87,6 +125,8 @@ class WorldQuantBrainClient:
                     sleep_sec = max(1, int(retry_after))
                 else:
                     sleep_sec = min(30, 2 ** (attempt - 1))
+                if response.status_code == 429:
+                    self._note_rate_limit(sleep_sec)
                 logger.warning(
                     "Auth transient failure %s (attempt %s/%s), retrying in %ss",
                     response.status_code,
@@ -111,7 +151,7 @@ class WorldQuantBrainClient:
         max_retries: int = 5,
         **kwargs,
     ) -> requests.Response:
-        url = url_or_path if url_or_path.startswith("http") else f"{self.BASE_URL}{url_or_path}"
+        url = url_or_path if url_or_path.startswith("http") else f"{self.base_url}{url_or_path}"
         last_response = None
 
         for attempt in range(1, max_retries + 1):
@@ -130,6 +170,8 @@ class WorldQuantBrainClient:
 
             if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
                 sleep_sec = self._retry_sleep_seconds(response, attempt)
+                if response.status_code == 429:
+                    self._note_rate_limit(sleep_sec)
                 logger.warning(
                     "Transient status %s on %s %s (attempt %s/%s), retry in %ss",
                     response.status_code,
@@ -149,11 +191,14 @@ class WorldQuantBrainClient:
         return last_response
 
     @staticmethod
-    def _retry_sleep_seconds(response: requests.Response, attempt: int) -> int:
+    def _retry_sleep_seconds(response: requests.Response, attempt: int) -> float:
         retry_after = response.headers.get("Retry-After")
         if retry_after and retry_after.isdigit():
-            return max(1, int(retry_after))
-        return min(30, 2 ** (attempt - 1))
+            base = max(1, int(retry_after))
+        else:
+            base = min(30, 2 ** (attempt - 1))
+        jitter = random.uniform(0.0, min(1.0, base * 0.25))
+        return base + jitter
 
     def get_datasets(
         self,
@@ -476,20 +521,20 @@ class WorldQuantBrainClient:
                 error_message="submit_failed: missing Location header",
             )
 
-        progress_url = location if location.startswith("http") else urljoin(f"{self.BASE_URL}/", location.lstrip("/"))
+        progress_url = location if location.startswith("http") else urljoin(f"{self.base_url}/", location.lstrip("/"))
         alpha_id = ""
         deadline = time.time() + max_wait_sec
 
         while time.time() < deadline:
             progress = self._request("GET", progress_url)
             if progress.status_code != 200:
-                time.sleep(poll_interval_sec)
+                time.sleep(self._poll_sleep_seconds(poll_interval_sec))
                 continue
             body = progress.json()
             if "alpha" in body and body["alpha"]:
                 alpha_id = str(body["alpha"]).rstrip("/").split("/")[-1]
                 break
-            time.sleep(poll_interval_sec)
+            time.sleep(self._poll_sleep_seconds(poll_interval_sec))
 
         if not alpha_id:
             return SimulationResult(
@@ -540,6 +585,12 @@ class WorldQuantBrainClient:
             sub_universe_sharpe=sub_universe_sharpe,
             link=f"{self.PLATFORM_ALPHA_URL}{alpha_id}",
         )
+
+    @staticmethod
+    def _poll_sleep_seconds(poll_interval_sec: int) -> float:
+        base = max(1.0, float(poll_interval_sec))
+        jitter = min(1.0, base * 0.2)
+        return base + random.uniform(0.0, jitter)
 
 
 def _to_float(value) -> float:

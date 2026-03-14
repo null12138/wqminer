@@ -1,4 +1,0 @@
-interface:
-  display_name: "WQ OpenClaw Optimizer"
-  short_description: "Iterative WQ alpha optimization for OpenClaw"
-  default_prompt: "Use $wq-openclaw-alpha-optimizer to run one optimization round with my LLM endpoint and submit candidates."

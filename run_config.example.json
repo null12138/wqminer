@@ -1,0 +1,22 @@
+{
+  "region": "USA",
+  "universe": "TOP3000",
+  "delay": 1,
+  "credentials": "credentials.json",
+  "username": "",
+  "password": "",
+  "llm_config": "llm.json",
+  "template_count": 20,
+  "style": "",
+  "inspiration": "",
+  "seed_templates": "templates/library.json",
+  "library_output": "templates/library.json",
+  "library_sharpe_min": 1.2,
+  "library_fitness_min": 1.0,
+  "output_dir": "results/one_click",
+  "poll_interval": 30,
+  "max_wait": 600,
+  "evolve_rounds": 0,
+  "evolve_count": 0,
+  "evolve_top_k": 6
+}

@@ -1,0 +1,14 @@
+[
+  "rank(close)",
+  "rank(volume)",
+  "ts_zscore(returns, 10)",
+  "ts_zscore(volume, 20)",
+  "ts_rank(close, 10)",
+  "ts_rank(volume, 20)",
+  "rank(ts_delta(close, 5))",
+  "rank(ts_mean(returns, 5))",
+  "rank(ts_stddev(returns, 20))",
+  "rank(ts_decay_linear(returns, 10))",
+  "rank(ts_corr(close, volume, 20))",
+  "rank(ts_covariance(close, volume, 20))"
+]

@@ -1,25 +1,22 @@
-"""Service layer decoupling CLI/WebUI from core workflows."""
+"""Minimal service layer for one-click flow."""
 
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .config import load_credentials, load_llm_config
 from .inspiration import merge_style_prompt
-from .iterative_generator import IterativeTemplateGenerator
 from .llm_client import OpenAICompatibleLLM
-from .miner import FactorMiner, MiningConfig
 from .models import DataField, SimulationSettings
-from .mutator import ExpressionMutator
 from .operator_store import load_operators
 from .region_config import get_default_neutralization, get_default_universe
-from .storage import load_data_fields_cache, load_templates, save_data_fields_cache, save_templates
+from .storage import load_data_fields_cache, save_data_fields_cache
 from .template_generator import TemplateGenerator
 from .worldquant_client import WorldQuantBrainClient
-from .submitter import submit_expressions_concurrent
 
 
 def default_fields_cache_path(region: str, universe: str, delay: int) -> str:
@@ -39,120 +36,6 @@ def resolve_credentials(
     if required:
         raise ValueError("Need credentials (credentials file or username/password)")
     return "", ""
-
-
-def build_client(username: str, password: str) -> WorldQuantBrainClient:
-    client = WorldQuantBrainClient(username=username, password=password)
-    client.authenticate()
-    return client
-
-
-def load_or_fetch_fields(
-    region: str,
-    universe: str,
-    delay: int,
-    fields_file: str = "",
-    credentials_path: str = "",
-    username: str = "",
-    password: str = "",
-    required_if_missing: bool = True,
-) -> Tuple[List[DataField], str]:
-    region = region.upper()
-    universe = universe or get_default_universe(region)
-    cache_path = fields_file or default_fields_cache_path(region, universe, delay)
-
-    if fields_file and Path(fields_file).exists():
-        return load_data_fields_cache(fields_file), fields_file
-    if Path(cache_path).exists():
-        return load_data_fields_cache(cache_path), cache_path
-
-    if not required_if_missing:
-        return [], cache_path
-
-    user, pwd = resolve_credentials(credentials_path, username, password, required=True)
-    client = build_client(user, pwd)
-    fields = client.fetch_data_fields(region=region, universe=universe, delay=delay)
-    if not fields:
-        fields = client.load_fallback_default_fields()
-    save_data_fields_cache(cache_path, fields)
-    return fields, cache_path
-
-
-def fetch_fields_and_cache(
-    region: str,
-    universe: str,
-    delay: int,
-    credentials_path: str = "",
-    username: str = "",
-    password: str = "",
-    full: bool = False,
-    max_datasets: int = 10,
-    field_max_pages: int = 5,
-    dataset_max_pages: int = 1,
-    dataset_page_limit: int = 50,
-    output: str = "",
-    dataset_output: str = "",
-) -> Dict:
-    region = region.upper()
-    universe = universe or get_default_universe(region)
-
-    user, pwd = resolve_credentials(credentials_path, username, password, required=True)
-    client = build_client(user, pwd)
-
-    if full:
-        fields, datasets = client.fetch_data_fields_and_datasets(
-            region=region,
-            universe=universe,
-            delay=delay,
-            max_datasets=None,
-            max_pages=None,
-            dataset_max_pages=None,
-            dataset_page_limit=dataset_page_limit,
-        )
-        source = "api_full"
-    else:
-        fields, datasets = client.fetch_data_fields_and_datasets(
-            region=region,
-            universe=universe,
-            delay=delay,
-            max_datasets=max_datasets,
-            max_pages=field_max_pages,
-            dataset_max_pages=dataset_max_pages,
-            dataset_page_limit=dataset_page_limit,
-        )
-        source = "api"
-
-    if not fields:
-        fields = client.load_fallback_default_fields()
-        source = "fallback"
-
-    output_path = output or default_fields_cache_path(region, universe, delay)
-    save_data_fields_cache(output_path, fields)
-
-    dataset_path = dataset_output or f"data/cache/data_sets_{region}_{delay}_{universe}.json"
-    dataset_payload = {
-        "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "region": region,
-        "universe": universe,
-        "delay": delay,
-        "source": source,
-        "dataset_count": len(datasets),
-        "datasets": datasets,
-    }
-    dataset_file = Path(dataset_path)
-    dataset_file.parent.mkdir(parents=True, exist_ok=True)
-    dataset_file.write_text(json.dumps(dataset_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    return {
-        "fields_path": output_path,
-        "dataset_path": str(dataset_file),
-        "field_count": len(fields),
-        "dataset_count": len(datasets),
-        "region": region,
-        "universe": universe,
-        "delay": delay,
-        "source": source,
-    }
 
 
 def generate_inspiration_text(
@@ -197,284 +80,6 @@ def generate_inspiration_text(
     return cleaned
 
 
-def generate_templates(
-    region: str,
-    universe: str,
-    delay: int,
-    llm_config_path: str,
-    fields_file: str = "",
-    credentials_path: str = "",
-    username: str = "",
-    password: str = "",
-    count: int = 24,
-    style_prompt: str = "",
-    inspiration: str = "",
-    output: str = "templates/generated_templates.json",
-    operators_file: str = "",
-) -> Dict:
-    region = region.upper()
-    universe = universe or get_default_universe(region)
-
-    fields, fields_cache = load_or_fetch_fields(
-        region=region,
-        universe=universe,
-        delay=delay,
-        fields_file=fields_file,
-        credentials_path=credentials_path,
-        username=username,
-        password=password,
-        required_if_missing=True,
-    )
-
-    operators = load_operators(operators_file) if operators_file else load_operators()
-    llm = OpenAICompatibleLLM(load_llm_config(llm_config_path))
-    generator = TemplateGenerator(llm=llm, operators=operators)
-
-    merged_style = merge_style_prompt(style_prompt, inspiration)
-    templates = generator.generate_templates(
-        region=region,
-        data_fields=fields,
-        count=max(1, int(count)),
-        style_prompt=merged_style,
-    )
-
-    metadata = {
-        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "region": region,
-        "universe": universe,
-        "delay": delay,
-        "template_count": len(templates),
-        "field_count": len(fields),
-        "operator_count": len(operators),
-        "fields_cache": fields_cache,
-    }
-    save_templates(output, templates, metadata)
-
-    return {
-        "output": output,
-        "template_count": len(templates),
-        "metadata": metadata,
-    }
-
-
-def generate_templates_iter(
-    region: str,
-    universe: str,
-    delay: int,
-    llm_config_path: str,
-    fields_file: str = "",
-    credentials_path: str = "",
-    username: str = "",
-    password: str = "",
-    count: int = 48,
-    rounds: int = 3,
-    max_fix_attempts: int = 1,
-    style_prompt: str = "",
-    inspiration: str = "",
-    syntax_guide: str = "",
-    output: str = "templates/generated_templates_iter.json",
-    report_output: str = "results/gen_templates_iter_report.json",
-    operators_file: str = "",
-) -> Dict:
-    region = region.upper()
-    universe = universe or get_default_universe(region)
-
-    fields, fields_cache = load_or_fetch_fields(
-        region=region,
-        universe=universe,
-        delay=delay,
-        fields_file=fields_file,
-        credentials_path=credentials_path,
-        username=username,
-        password=password,
-        required_if_missing=True,
-    )
-
-    operators = load_operators(operators_file) if operators_file else load_operators()
-    llm = OpenAICompatibleLLM(load_llm_config(llm_config_path))
-
-    merged_style = merge_style_prompt(style_prompt, inspiration)
-    generator = IterativeTemplateGenerator(llm=llm, operators=operators)
-    templates, iter_report = generator.generate(
-        region=region,
-        data_fields=fields,
-        count=max(1, int(count)),
-        rounds=max(1, int(rounds)),
-        style_prompt=merged_style,
-        syntax_guide=syntax_guide,
-        max_fix_attempts=max(0, int(max_fix_attempts)),
-    )
-
-    metadata = {
-        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "region": region,
-        "universe": universe,
-        "delay": delay,
-        "template_count": len(templates),
-        "field_count": len(fields),
-        "operator_count": len(operators),
-        "mode": "iterative",
-        "rounds": max(1, int(rounds)),
-        "max_fix_attempts": max(0, int(max_fix_attempts)),
-        "fields_cache": fields_cache,
-    }
-    save_templates(output, templates, metadata)
-
-    report_payload = {
-        "metadata": metadata,
-        "iterative_report": iter_report,
-    }
-    report_path = Path(report_output)
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    return {
-        "output": output,
-        "report_output": str(report_path),
-        "template_count": len(templates),
-        "metadata": metadata,
-    }
-
-
-def optimize_loop(
-    region: str,
-    universe: str,
-    delay: int,
-    templates_file: str = "",
-    expressions: Optional[Sequence[str]] = None,
-    fields_file: str = "",
-    credentials_path: str = "",
-    username: str = "",
-    password: str = "",
-    rounds: int = 3,
-    variants_per_template: int = 8,
-    max_simulations: int = 200,
-    sharpe_threshold: float = 1.25,
-    fitness_threshold: float = 1.0,
-    output_dir: str = "results",
-    neutralization: str = "",
-    dry_run: bool = False,
-) -> Dict:
-    region = region.upper()
-    universe = universe or get_default_universe(region)
-    neutralization = neutralization or get_default_neutralization(region)
-
-    exprs: List[str] = []
-    if expressions:
-        exprs.extend([x.strip() for x in expressions if x and x.strip()])
-    if templates_file:
-        exprs.extend(load_templates(templates_file))
-    exprs = [x for x in exprs if x]
-    if not exprs:
-        raise ValueError("No expressions provided for optimize loop")
-
-    if fields_file and Path(fields_file).exists():
-        fields = load_data_fields_cache(fields_file)
-    elif dry_run:
-        fields = []
-    else:
-        fields, _ = load_or_fetch_fields(
-            region=region,
-            universe=universe,
-            delay=delay,
-            fields_file=fields_file,
-            credentials_path=credentials_path,
-            username=username,
-            password=password,
-            required_if_missing=True,
-        )
-
-    operators = load_operators()
-    mutator = ExpressionMutator(operators=operators)
-
-    client = None
-    if not dry_run:
-        user, pwd = resolve_credentials(credentials_path, username, password, required=True)
-        client = build_client(user, pwd)
-
-    settings = SimulationSettings(
-        region=region,
-        universe=universe,
-        delay=delay,
-        neutralization=neutralization,
-    )
-
-    miner = FactorMiner(client=client, mutator=mutator, output_dir=output_dir)
-    report = miner.mine(
-        seed_expressions=exprs,
-        available_field_ids=[f.field_id for f in fields if f.field_id],
-        settings=settings,
-        config=MiningConfig(
-            rounds=max(1, int(rounds)),
-            variants_per_template=max(1, int(variants_per_template)),
-            max_simulations=max(1, int(max_simulations)),
-            sharpe_threshold=float(sharpe_threshold),
-            fitness_threshold=float(fitness_threshold),
-            dry_run=bool(dry_run),
-        ),
-    )
-
-    report["settings"] = {
-        "region": region,
-        "universe": universe,
-        "delay": delay,
-        "neutralization": neutralization,
-        "dry_run": bool(dry_run),
-    }
-    report["expression_count"] = len(exprs)
-    return report
-
-
-def submit_concurrent(
-    region: str,
-    universe: str,
-    delay: int,
-    templates_file: str = "",
-    expressions: Optional[Sequence[str]] = None,
-    credentials_path: str = "",
-    username: str = "",
-    password: str = "",
-    max_submissions: int = 60,
-    concurrency: int = 3,
-    max_wait_sec: int = 240,
-    poll_interval_sec: int = 5,
-    output_dir: str = "results/submissions",
-    neutralization: str = "",
-) -> Dict:
-    region = region.upper()
-    universe = universe or get_default_universe(region)
-    neutralization = neutralization or get_default_neutralization(region)
-
-    exprs: List[str] = []
-    if expressions:
-        exprs.extend([x.strip() for x in expressions if x and x.strip()])
-    if templates_file:
-        exprs.extend(load_templates(templates_file))
-    exprs = [x for x in exprs if x]
-    if not exprs:
-        raise ValueError("No expressions provided for submit")
-
-    user, pwd = resolve_credentials(credentials_path, username, password, required=True)
-
-    settings = SimulationSettings(
-        region=region,
-        universe=universe,
-        delay=delay,
-        neutralization=neutralization,
-    )
-    return submit_expressions_concurrent(
-        expressions=exprs,
-        username=user,
-        password=pwd,
-        settings=settings,
-        max_submissions=max(1, int(max_submissions)),
-        concurrency=max(1, int(concurrency)),
-        max_wait_sec=max(30, int(max_wait_sec)),
-        poll_interval_sec=max(1, int(poll_interval_sec)),
-        output_dir=output_dir,
-    )
-
-
 def _clean_inspiration_text(raw: str) -> str:
     if not raw:
         return ""
@@ -490,3 +95,284 @@ def _clean_inspiration_text(raw: str) -> str:
         return text.strip()
     merged = " ".join(cleaned[:2]).strip()
     return merged if merged else text.strip()
+
+
+def _unique_expressions(items: Sequence[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        expr = (item or "").strip()
+        if not expr:
+            continue
+        if expr in seen:
+            continue
+        seen.add(expr)
+        out.append(expr)
+    return out
+
+
+def _load_seed_expressions(path: str) -> List[str]:
+    if not path:
+        return []
+    src = Path(path)
+    if not src.exists():
+        return []
+    try:
+        payload = json.loads(src.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if isinstance(payload, dict) and isinstance(payload.get("templates"), list):
+        items = payload.get("templates", [])
+    else:
+        items = payload if isinstance(payload, list) else []
+    expressions: List[str] = []
+    for item in items:
+        if isinstance(item, dict) and item.get("expression"):
+            expressions.append(str(item.get("expression", "")).strip())
+        elif isinstance(item, str):
+            expressions.append(item.strip())
+    return _unique_expressions(expressions)
+
+
+def _score_row(row: Dict[str, float]) -> float:
+    return float(row.get("sharpe", 0.0)) + 0.5 * float(row.get("fitness", 0.0)) - 0.01 * float(row.get("turnover", 0.0))
+
+
+def _select_top_rows(rows: Sequence[Dict[str, float]], top_k: int) -> List[Dict[str, float]]:
+    if not rows:
+        return []
+    ranked = sorted(rows, key=_score_row, reverse=True)
+    return ranked[: max(1, int(top_k))]
+
+
+def _build_evolution_hint(rows: Sequence[Dict[str, float]]) -> str:
+    lines = []
+    for row in rows:
+        expr = str(row.get("expression", "")).strip()
+        if not expr:
+            continue
+        lines.append(
+            f"- {expr} | sharpe={row.get('sharpe', 0.0):.3f}, "
+            f"fitness={row.get('fitness', 0.0):.3f}, turnover={row.get('turnover', 0.0):.2f}"
+        )
+    if not lines:
+        return ""
+    return (
+        "Evolution guidance:\n"
+        "Use the best-performing expressions below as parents. "
+        "Create improved variants by combining ideas, improving sharpe/fitness, "
+        "and keeping turnover reasonable. Avoid duplicates.\n"
+        + "\n".join(lines)
+    )
+
+
+def _generate_expressions(
+    generator: TemplateGenerator,
+    region: str,
+    fields: Sequence[DataField],
+    count: int,
+    style_prompt: str,
+) -> List[str]:
+    templates = generator.generate_templates(
+        region=region,
+        data_fields=list(fields),
+        count=max(1, int(count)),
+        style_prompt=style_prompt,
+    )
+    expressions = [t.expression for t in templates if t and t.expression]
+    return _unique_expressions(expressions)
+
+
+def _evaluate_expressions(
+    client: WorldQuantBrainClient,
+    expressions: Sequence[str],
+    settings: SimulationSettings,
+    poll_interval_sec: int,
+    max_wait_sec: int,
+) -> List[Dict[str, float]]:
+    results: List[Dict[str, float]] = []
+    total = len(expressions)
+    for idx, expr in enumerate(expressions, start=1):
+        try:
+            result = client.simulate_expression(
+                expression=expr,
+                settings=settings,
+                poll_interval_sec=max(1, int(poll_interval_sec)),
+                max_wait_sec=max(30, int(max_wait_sec)),
+            )
+            if result.success:
+                row = {
+                    "expression": expr,
+                    "sharpe": float(result.sharpe),
+                    "fitness": float(result.fitness),
+                    "turnover": float(result.turnover),
+                }
+            else:
+                row = {"expression": expr, "sharpe": 0.0, "fitness": 0.0, "turnover": 0.0}
+        except Exception as exc:
+            logging.warning("Simulation failed (%s/%s): %s", idx, total, exc)
+            row = {"expression": expr, "sharpe": 0.0, "fitness": 0.0, "turnover": 0.0}
+
+        results.append(row)
+        logging.info(
+            "Simulated %s/%s sharpe=%.3f fitness=%.3f turnover=%.2f",
+            idx,
+            total,
+            row["sharpe"],
+            row["fitness"],
+            row["turnover"],
+        )
+    return results
+
+
+def _write_results_json(path: Path, rows: Sequence[Dict[str, float]]) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [
+        {
+            "expression": str(row.get("expression", "")).strip(),
+            "sharpe": float(row.get("sharpe", 0.0)),
+            "fitness": float(row.get("fitness", 0.0)),
+            "turnover": float(row.get("turnover", 0.0)),
+        }
+        for row in rows
+        if row.get("expression")
+    ]
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
+def _append_library(
+    library_path: str,
+    rows: Sequence[Dict[str, float]],
+    sharpe_threshold: float,
+    fitness_threshold: float,
+) -> int:
+    if not library_path:
+        return 0
+    src = Path(library_path)
+    existing: List[str] = []
+    if src.exists():
+        try:
+            payload = json.loads(src.read_text(encoding="utf-8"))
+        except Exception:
+            payload = []
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict) and item.get("expression"):
+                    existing.append(str(item.get("expression", "")).strip())
+                elif isinstance(item, str):
+                    existing.append(item.strip())
+
+    seen = {x for x in existing if x}
+    added: List[str] = []
+    for row in rows:
+        expr = str(row.get("expression", "")).strip()
+        if not expr or expr in seen:
+            continue
+        if float(row.get("sharpe", 0.0)) >= sharpe_threshold and float(row.get("fitness", 0.0)) >= fitness_threshold:
+            seen.add(expr)
+            added.append(expr)
+
+    if not added:
+        return 0
+
+    merged = existing + added
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    return len(added)
+
+
+def run_one_click(
+    region: str,
+    universe: str,
+    delay: int,
+    llm_config_path: str,
+    credentials_path: str = "",
+    username: str = "",
+    password: str = "",
+    template_count: int = 20,
+    style_prompt: str = "",
+    inspiration: str = "",
+    output_dir: str = "results/one_click",
+    poll_interval_sec: int = 30,
+    max_wait_sec: int = 600,
+    evolve_rounds: int = 0,
+    evolve_count: int = 0,
+    evolve_top_k: int = 6,
+    seed_templates: str = "",
+    library_output: str = "",
+    library_sharpe_min: float = 1.2,
+    library_fitness_min: float = 1.0,
+) -> Dict:
+    region = region.upper()
+    universe = universe or get_default_universe(region)
+    neutralization = get_default_neutralization(region)
+
+    user, pwd = resolve_credentials(credentials_path, username, password, required=True)
+
+    client = WorldQuantBrainClient(username=user, password=pwd)
+    client.authenticate()
+
+    fields_cache = default_fields_cache_path(region, universe, delay)
+    if Path(fields_cache).exists():
+        fields = load_data_fields_cache(fields_cache)
+        logging.info("Using cached fields: %s (count=%d)", fields_cache, len(fields))
+    else:
+        fields = client.fetch_data_fields(region=region, universe=universe, delay=delay)
+        if not fields:
+            fields = client.load_fallback_default_fields()
+        save_data_fields_cache(fields_cache, fields)
+
+    seed_exprs = _load_seed_expressions(seed_templates)
+    if not inspiration:
+        inspiration = generate_inspiration_text(
+            llm_config_path=llm_config_path,
+            region=region,
+            universe=universe,
+            delay=delay,
+            style_seed=style_prompt,
+            seed_expressions=seed_exprs,
+        )
+
+    operators = load_operators()
+    llm = OpenAICompatibleLLM(load_llm_config(llm_config_path))
+    generator = TemplateGenerator(llm=llm, operators=operators)
+
+    base_style = merge_style_prompt(style_prompt, inspiration)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_root = Path(output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    files: List[str] = []
+    settings = SimulationSettings(
+        region=region,
+        universe=universe,
+        delay=delay,
+        neutralization=neutralization,
+    )
+
+    expressions = _generate_expressions(generator, region, fields, template_count, base_style)
+    results = _evaluate_expressions(client, expressions, settings, poll_interval_sec, max_wait_sec)
+    files.append(_write_results_json(out_root / f"one_click_{ts}_gen0.json", results))
+    appended = _append_library(library_output, results, library_sharpe_min, library_fitness_min)
+
+    rounds = max(0, int(evolve_rounds))
+    if rounds > 0:
+        per_round = evolve_count if evolve_count and int(evolve_count) > 0 else template_count
+        for round_idx in range(1, rounds + 1):
+            top_rows = _select_top_rows(results, evolve_top_k)
+            evolution_hint = _build_evolution_hint(top_rows)
+            if not evolution_hint:
+                break
+            style = merge_style_prompt(base_style, evolution_hint)
+            expressions = _generate_expressions(generator, region, fields, per_round, style)
+            results = _evaluate_expressions(client, expressions, settings, poll_interval_sec, max_wait_sec)
+            files.append(_write_results_json(out_root / f"one_click_{ts}_gen{round_idx}.json", results))
+            appended += _append_library(library_output, results, library_sharpe_min, library_fitness_min)
+
+    return {
+        "files": files,
+        "inspiration": inspiration,
+        "final_count": len(results),
+        "library_appended": appended,
+    }

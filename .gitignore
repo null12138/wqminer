@@ -18,6 +18,7 @@ Thumbs.db
 credentials.json
 llm.json
 llm.*.json
+run_config.json
 *.key
 *.pem
 
@@ -25,8 +26,10 @@ llm.*.json
 results/
 data/cache/
 logs/
+
+# Template libraries (track only the curated library)
 templates/*.json
-!templates/sample_templates.json
+!templates/library.json
 
 # Bundles / build
 build/

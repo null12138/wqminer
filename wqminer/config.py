@@ -80,3 +80,10 @@ def normalize_llm_base_url(base_url: str) -> str:
 
     normalized = urlunparse((scheme, netloc, path, "", "", ""))
     return normalized.rstrip("/")
+
+
+def load_run_config(path: str) -> Dict:
+    payload = load_json_file(path)
+    if not isinstance(payload, dict):
+        raise ValueError("Run config must be a JSON object")
+    return payload
