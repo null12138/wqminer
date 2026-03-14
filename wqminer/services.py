@@ -254,6 +254,7 @@ def _evaluate_expressions(
     username: str,
     password: str,
     timeout_sec: int,
+    max_retries: int,
     expressions: Sequence[str],
     settings: SimulationSettings,
     poll_interval_sec: int,
@@ -271,7 +272,12 @@ def _evaluate_expressions(
     def get_client() -> WorldQuantBrainClient:
         client = getattr(local, "client", None)
         if client is None:
-            client = WorldQuantBrainClient(username=username, password=password, timeout_sec=max(5, int(timeout_sec)))
+            client = WorldQuantBrainClient(
+                username=username,
+                password=password,
+                timeout_sec=max(5, int(timeout_sec)),
+                max_retries=max(1, int(max_retries)),
+            )
             with auth_lock:
                 client.authenticate()
             local.client = client
@@ -395,6 +401,7 @@ def run_one_click(
     output_dir: str = "results/one_click",
     concurrency: int = 3,
     timeout_sec: int = 60,
+    max_retries: int = 5,
     poll_interval_sec: int = 30,
     max_wait_sec: int = 600,
     max_rounds: int = 0,
@@ -413,7 +420,12 @@ def run_one_click(
 
     user, pwd = resolve_credentials(credentials_path, username, password, required=True)
 
-    client = WorldQuantBrainClient(username=user, password=pwd, timeout_sec=max(5, int(timeout_sec)))
+    client = WorldQuantBrainClient(
+        username=user,
+        password=pwd,
+        timeout_sec=max(5, int(timeout_sec)),
+        max_retries=max(1, int(max_retries)),
+    )
     client.authenticate()
 
     fields_cache = default_fields_cache_path(region, universe, delay)
@@ -473,6 +485,7 @@ def run_one_click(
                 username=user,
                 password=pwd,
                 timeout_sec=timeout_sec,
+                max_retries=max_retries,
                 expressions=expressions,
                 settings=settings,
                 poll_interval_sec=poll_interval_sec,

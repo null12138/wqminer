@@ -40,11 +40,19 @@ class WorldQuantBrainClient:
     _global_rate_limit_hits = 0
     _global_rate_limit_window_start = 0.0
 
-    def __init__(self, username: str, password: str, timeout_sec: int = 30, base_url: Optional[str] = None):
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        timeout_sec: int = 30,
+        base_url: Optional[str] = None,
+        max_retries: int = 5,
+    ):
         self.username = username
         self.password = password
         self.timeout_sec = timeout_sec
         self.base_url = (base_url or self.BASE_URL).rstrip("/")
+        self.max_retries = max(1, int(max_retries))
         self.sess = requests.Session()
         self.sess.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
         self.sess.auth = HTTPBasicAuth(username, password)
@@ -104,6 +112,8 @@ class WorldQuantBrainClient:
             cls._global_last_rate_limit_ts = now
 
     def authenticate(self, max_retries: int = 5) -> None:
+        if max_retries is None:
+            max_retries = self.max_retries
         last_response = None
         for attempt in range(1, max_retries + 1):
             try:
@@ -115,6 +125,7 @@ class WorldQuantBrainClient:
             except requests.RequestException as exc:
                 if attempt < max_retries:
                     sleep_sec = min(30, 2 ** (attempt - 1))
+                    self._reset_session()
                     logger.warning("Auth request error (%s), retrying in %ss", exc, sleep_sec)
                     time.sleep(sleep_sec)
                     continue
@@ -156,9 +167,11 @@ class WorldQuantBrainClient:
         method: str,
         url_or_path: str,
         retry_auth: bool = True,
-        max_retries: int = 5,
+        max_retries: Optional[int] = None,
         **kwargs,
     ) -> requests.Response:
+        if max_retries is None:
+            max_retries = self.max_retries
         url = url_or_path if url_or_path.startswith("http") else f"{self.base_url}{url_or_path}"
         last_response = None
 
@@ -173,6 +186,7 @@ class WorldQuantBrainClient:
             except requests.RequestException as exc:
                 if attempt < max_retries:
                     sleep_sec = min(30, 2 ** (attempt - 1))
+                    self._reset_session()
                     logger.warning("Request error on %s %s (%s), retry in %ss", method, url, exc, sleep_sec)
                     time.sleep(sleep_sec)
                     continue
@@ -215,6 +229,17 @@ class WorldQuantBrainClient:
             base = min(30, 2 ** (attempt - 1))
         jitter = random.uniform(0.0, min(1.0, base * 0.25))
         return base + jitter
+
+    def _reset_session(self) -> None:
+        headers = dict(self.sess.headers)
+        auth = self.sess.auth
+        try:
+            self.sess.close()
+        except Exception:
+            pass
+        self.sess = requests.Session()
+        self.sess.headers.update(headers)
+        self.sess.auth = auth
 
     def get_datasets(
         self,

@@ -28,7 +28,8 @@ python3 run.py --config run_config.json
 ## Key config knobs
 - `concurrency`: number of parallel simulations (default 3)
 - `poll_interval`: seconds between status polls (default 30)
-- `timeout_sec`: HTTP timeout per request (default 60)
+- `timeout_sec`: HTTP timeout per request (default 90)
+- `max_retries`: request retries for transient errors (default 8)
 - `max_rounds`: 0 = infinite
 - `sleep_between_rounds`: pause between rounds (seconds)
 
