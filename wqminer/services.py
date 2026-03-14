@@ -482,6 +482,7 @@ def run_one_click(
     reverse_fitness_max: float = -1.0,
     reverse_log: str = "",
     negate_max_per_round: int = 0,
+    stop_event: Optional[threading.Event] = None,
 ) -> Dict:
     region = region.upper()
     universe = universe or get_default_universe(region)
@@ -548,6 +549,9 @@ def run_one_click(
 
     try:
         while True:
+            if stop_event is not None and stop_event.is_set():
+                logging.info("Stop requested, exiting before round %s", round_idx + 1)
+                break
             round_idx += 1
             per_round = evolve_count if evolve_count and int(evolve_count) > 0 else template_count
             style = base_style if not reflection else merge_style_prompt(base_style, reflection)

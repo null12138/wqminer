@@ -62,14 +62,14 @@ Every file is a list of rows with only these fields:
 ```
 Reverse detections are logged to `results/one_click/reverse_flags.jsonl` when enabled.
 
-## Web query (history + query)
-Run a simple local web page:
+## Web console (control + query)
+One process handles everything: start/stop the flow + query results.
 ```bash
-python3 web_query.py --results-dir results/one_click --library templates/library.json
+bash start_web.sh
 ```
 Then open `http://localhost:8002` in your browser.
 
-One-click script:
+Optional overrides:
 ```bash
-bash start_web.sh
+CONFIG=run_config.json RESULTS_DIR=results/one_click LIBRARY=templates/library.json PORT=8002 bash start_web.sh
 ```

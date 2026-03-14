@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Simple web UI for history + factor query (no extra deps)."""
+"""One-page web console: query history + control local flow."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import logging
-import os
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
+
+from wqminer.config import load_run_config
+from wqminer import services
 
 
 HTML_PAGE = """<!doctype html>
@@ -18,7 +22,7 @@ HTML_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>WQMiner 查询</title>
+  <title>WQMiner 控制台</title>
   <style>
     :root {
       --bg: #0f1115;
@@ -26,6 +30,7 @@ HTML_PAGE = """<!doctype html>
       --text: #e7eaf0;
       --muted: #9aa3b2;
       --accent: #5ad2c9;
+      --danger: #ff6b6b;
       --border: #2a2f3a;
       --shadow: 0 12px 32px rgba(0,0,0,.35);
       font-family: "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -52,6 +57,7 @@ HTML_PAGE = """<!doctype html>
       font-size: 14px;
     }
     button { background: var(--accent); color: #0b0e14; font-weight: 600; cursor: pointer; }
+    button.danger { background: var(--danger); color: #0b0e14; }
     button:hover { filter: brightness(1.05); }
     pre {
       white-space: pre-wrap;
@@ -63,12 +69,37 @@ HTML_PAGE = """<!doctype html>
       color: #d5d9e3;
     }
     .muted { color: var(--muted); font-size: 12px; }
+    .status-pill {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      background: #0b0e14;
+    }
+    .status-run { color: #6be675; border-color: #1f6f3a; }
+    .status-stop { color: #ff9f9f; border-color: #6f1f1f; }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>WQMiner 查询</h1>
-    <p>查询历史因子与模板库。默认读取 results/one_click 与 templates/library.json。</p>
+    <h1>WQMiner 控制台</h1>
+    <p>一体化：Web 控制主流程 + 历史/模板查询。</p>
+
+    <div class="panel">
+      <div class="row">
+        <button id="start">启动主流程</button>
+        <button id="stop" class="danger">停止主流程</button>
+        <span id="status" class="status-pill">状态: unknown</span>
+      </div>
+      <div class="muted" id="meta">加载中...</div>
+    </div>
+
+    <div class="panel">
+      <h3 style="margin:0 0 8px; font-size:14px;">日志</h3>
+      <pre id="log">等待日志...</pre>
+    </div>
 
     <div class="panel">
       <div class="row">
@@ -95,6 +126,11 @@ HTML_PAGE = """<!doctype html>
     const keyword = document.getElementById("keyword");
     const limit = document.getElementById("limit");
     const runBtn = document.getElementById("run");
+    const startBtn = document.getElementById("start");
+    const stopBtn = document.getElementById("stop");
+    const statusEl = document.getElementById("status");
+    const metaEl = document.getElementById("meta");
+    const logEl = document.getElementById("log");
 
     async function runQuery() {
       const m = mode.value;
@@ -118,7 +154,33 @@ HTML_PAGE = """<!doctype html>
       }
     }
 
+    async function fetchStatus() {
+      try {
+        const resp = await fetch("/api/status");
+        const data = await resp.json();
+        const running = data.running;
+        statusEl.textContent = running ? "状态: 运行中" : "状态: 已停止";
+        statusEl.className = running ? "status-pill status-run" : "status-pill status-stop";
+        metaEl.textContent = data.meta || "";
+        logEl.textContent = data.log || "暂无日志";
+      } catch (err) {
+        statusEl.textContent = "状态: unknown";
+        metaEl.textContent = "状态获取失败: " + err;
+      }
+    }
+
+    startBtn.addEventListener("click", async () => {
+      await fetch("/api/start", { method: "POST" });
+      fetchStatus();
+    });
+    stopBtn.addEventListener("click", async () => {
+      await fetch("/api/stop", { method: "POST" });
+      fetchStatus();
+    });
     runBtn.addEventListener("click", runQuery);
+
+    fetchStatus();
+    setInterval(fetchStatus, 3000);
   </script>
 </body>
 </html>
@@ -126,17 +188,24 @@ HTML_PAGE = """<!doctype html>
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="WQMiner web query")
+    parser = argparse.ArgumentParser(description="WQMiner web console")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
     parser.add_argument("--port", type=int, default=8002, help="Port to bind")
-    parser.add_argument("--results-dir", default="results/one_click", help="Results directory")
-    parser.add_argument("--library", default="templates/library.json", help="Template library path")
+    parser.add_argument("--config", default="run_config.json", help="Run config JSON path")
+    parser.add_argument("--results-dir", default="", help="Override results dir for query")
+    parser.add_argument("--library", default="", help="Override library path for query")
     parser.add_argument("--log-level", default="INFO", help="DEBUG/INFO/WARNING/ERROR")
+    parser.add_argument("--log-limit", type=int, default=200, help="Log lines kept in memory")
     return parser.parse_args()
 
 
 def configure_logging(level: str) -> None:
     logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+
+
+def _get(cfg: dict, key: str, default):
+    value = cfg.get(key, default)
+    return default if value is None else value
 
 
 def _load_results(results_dir: str) -> List[Dict[str, float]]:
@@ -221,10 +290,128 @@ def _format_library(rows: List[str], limit: int) -> str:
     return "\n".join(rows[: max(1, int(limit))])
 
 
-class Handler(BaseHTTPRequestHandler):
-    results_dir: str = "results/one_click"
-    library_path: str = "templates/library.json"
+def _results_stats(results_dir: str) -> Dict[str, str]:
+    root = Path(results_dir)
+    if not root.exists():
+        return {"count": "0", "latest": "none"}
+    files = sorted(root.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    if not files:
+        return {"count": "0", "latest": "none"}
+    return {"count": str(len(files)), "latest": files[-1].name}
 
+
+class LogBufferHandler(logging.Handler):
+    def __init__(self, limit: int = 200):
+        super().__init__()
+        self.limit = max(50, int(limit))
+        self._lines: List[str] = []
+        self._lock = threading.Lock()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = self.format(record)
+        with self._lock:
+            self._lines.append(msg)
+            if len(self._lines) > self.limit:
+                self._lines = self._lines[-self.limit :]
+
+    def get_text(self) -> str:
+        with self._lock:
+            return "\n".join(self._lines[-self.limit :])
+
+
+class FlowController:
+    def __init__(self, config_path: str, results_dir_override: str, library_override: str):
+        self.config_path = config_path
+        self.results_dir_override = results_dir_override
+        self.library_override = library_override
+        self.lock = threading.Lock()
+        self.running = False
+        self.thread: Optional[threading.Thread] = None
+        self.stop_event: Optional[threading.Event] = None
+        self.last_start = ""
+        self.last_stop = ""
+        self.last_error = ""
+        self.last_summary: Optional[Dict] = None
+        self.results_dir = results_dir_override or "results/one_click"
+        self.library_path = library_override or "templates/library.json"
+
+    def _now(self) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def start(self) -> str:
+        with self.lock:
+            if self.running:
+                return "already running"
+            self.stop_event = threading.Event()
+            self.running = True
+            self.last_error = ""
+            self.last_start = self._now()
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+            return "started"
+
+    def stop(self) -> str:
+        with self.lock:
+            if not self.running or not self.stop_event:
+                return "not running"
+            self.stop_event.set()
+            return "stop requested"
+
+    def _run(self) -> None:
+        try:
+            cfg = load_run_config(self.config_path)
+            output_dir = self.results_dir_override or _get(cfg, "output_dir", "results/one_click")
+            library_output = self.library_override or _get(cfg, "library_output", "templates/library.json")
+            self.results_dir = output_dir
+            self.library_path = library_output
+
+            summary = services.run_one_click(
+                region=_get(cfg, "region", "USA"),
+                universe=_get(cfg, "universe", ""),
+                delay=int(_get(cfg, "delay", 1)),
+                llm_config_path=_get(cfg, "llm_config", "llm.json"),
+                credentials_path=_get(cfg, "credentials", ""),
+                username=_get(cfg, "username", ""),
+                password=_get(cfg, "password", ""),
+                template_count=int(_get(cfg, "template_count", 20)),
+                style_prompt=_get(cfg, "style", ""),
+                inspiration=_get(cfg, "inspiration", ""),
+                output_dir=output_dir,
+                concurrency=int(_get(cfg, "concurrency", 3)),
+                timeout_sec=int(_get(cfg, "timeout_sec", 60)),
+                max_retries=int(_get(cfg, "max_retries", 5)),
+                poll_interval_sec=int(_get(cfg, "poll_interval", 30)),
+                max_wait_sec=int(_get(cfg, "max_wait", 600)),
+                max_rounds=int(_get(cfg, "max_rounds", 0)),
+                sleep_between_rounds=int(_get(cfg, "sleep_between_rounds", 5)),
+                evolve_rounds=int(_get(cfg, "evolve_rounds", 0)),
+                evolve_count=int(_get(cfg, "evolve_count", 0)),
+                evolve_top_k=int(_get(cfg, "evolve_top_k", 6)),
+                seed_templates=_get(cfg, "seed_templates", ""),
+                library_output=library_output,
+                library_sharpe_min=float(_get(cfg, "library_sharpe_min", 1.2)),
+                library_fitness_min=float(_get(cfg, "library_fitness_min", 1.0)),
+                reverse_sharpe_max=float(_get(cfg, "reverse_sharpe_max", -1.2)),
+                reverse_fitness_max=float(_get(cfg, "reverse_fitness_max", -1.0)),
+                reverse_log=_get(cfg, "reverse_log", ""),
+                negate_max_per_round=int(_get(cfg, "negate_max_per_round", 0)),
+                stop_event=self.stop_event,
+            )
+            self.last_summary = summary
+        except Exception as exc:
+            self.last_error = str(exc)
+            logging.exception("Flow failed: %s", exc)
+        finally:
+            with self.lock:
+                self.running = False
+                self.last_stop = self._now()
+
+
+APP_STATE: Optional[FlowController] = None
+LOG_BUFFER: Optional[LogBufferHandler] = None
+
+
+class Handler(BaseHTTPRequestHandler):
     def _send_json(self, payload: Dict, status: int = 200) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -244,10 +431,34 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        if parsed.path == "/api/status":
+            state = APP_STATE
+            if not state:
+                self._send_json({"error": "state not ready"}, status=500)
+                return
+            stats = _results_stats(state.results_dir)
+            meta = (
+                f"running={state.running} | results={stats['count']} | latest={stats['latest']} | "
+                f"start={state.last_start or '-'} | stop={state.last_stop or '-'} | "
+                f"error={state.last_error or '-'}"
+            )
+            self._send_json(
+                {
+                    "running": state.running,
+                    "meta": meta,
+                    "log": LOG_BUFFER.get_text() if LOG_BUFFER else "",
+                }
+            )
+            return
+
         if parsed.path.startswith("/api/"):
+            state = APP_STATE
+            if not state:
+                self._send_json({"text": "state not ready"}, status=500)
+                return
             qs = parse_qs(parsed.query)
             limit = int(qs.get("limit", ["12"])[0] or 12)
-            records = _load_results(self.results_dir)
+            records = _load_results(state.results_dir)
             if parsed.path == "/api/history":
                 tail = records[-limit:] if records else []
                 self._send_json({"text": _format_rows(tail, limit)})
@@ -262,7 +473,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"text": "missing keyword"}, status=400)
                     return
                 matches = [r for r in records if key in r.get("expression", "").lower()]
-                library = _load_library(self.library_path)
+                library = _load_library(state.library_path)
                 lib_matches = [x for x in library if key in x.lower()]
                 text = "\n".join(
                     [
@@ -278,18 +489,40 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        state = APP_STATE
+        if not state:
+            self._send_json({"error": "state not ready"}, status=500)
+            return
+        if parsed.path == "/api/start":
+            msg = state.start()
+            self._send_json({"ok": True, "message": msg})
+            return
+        if parsed.path == "/api/stop":
+            msg = state.stop()
+            self._send_json({"ok": True, "message": msg})
+            return
+        self.send_response(404)
+        self.end_headers()
+
     def log_message(self, fmt: str, *args) -> None:
         logging.info("%s - %s", self.address_string(), fmt % args)
 
 
 def main() -> int:
+    global APP_STATE, LOG_BUFFER
     args = parse_args()
     configure_logging(args.log_level)
-    Handler.results_dir = args.results_dir
-    Handler.library_path = args.library
+
+    LOG_BUFFER = LogBufferHandler(limit=args.log_limit)
+    LOG_BUFFER.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(LOG_BUFFER)
+
+    APP_STATE = FlowController(args.config, args.results_dir, args.library)
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    logging.info("Web query listening on http://%s:%s", args.host, args.port)
+    logging.info("Web console listening on http://%s:%s", args.host, args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
