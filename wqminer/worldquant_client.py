@@ -64,7 +64,9 @@ class WorldQuantBrainClient:
         self.request_jitter_sec = _env_float("WQMINER_REQUEST_JITTER", 0.0)
         self.metadata_min_interval_sec = _env_float("WQMINER_METADATA_MIN_INTERVAL", 0.0)
         self.metadata_jitter_sec = _env_float("WQMINER_METADATA_JITTER", 0.0)
+        self.auth_min_interval_sec = _env_float("WQMINER_AUTH_MIN_INTERVAL", 6.0)
         self._auth_snapshot_ts = 0.0
+        self._last_auth_attempt_ts = 0.0
 
     def _sync_shared_auth(self) -> None:
         cls = self.__class__
@@ -78,6 +80,25 @@ class WorldQuantBrainClient:
             if cls._shared_cookies:
                 self.sess.cookies.update(cls._shared_cookies)
             self._auth_snapshot_ts = cls._shared_auth_ts
+
+    def _recent_shared_auth(self) -> bool:
+        cls = self.__class__
+        if cls._shared_auth_ts <= 0:
+            return False
+        return (time.monotonic() - cls._shared_auth_ts) < self.auth_min_interval_sec
+
+    @classmethod
+    def _note_connect_failure(cls, sleep_sec: float) -> None:
+        if sleep_sec <= 0:
+            return
+        now = time.monotonic()
+        with cls._global_lock:
+            cooldown = now + min(8.0, sleep_sec)
+            if cooldown > cls._global_cooldown_until:
+                cls._global_cooldown_until = cooldown
+            floor = min(4.0, max(0.5, sleep_sec * 0.5))
+            if floor > cls._global_min_interval_floor:
+                cls._global_min_interval_floor = floor
 
     @classmethod
     def _throttle(cls, min_interval_sec: float, jitter_sec: float, bucket: str) -> None:
@@ -136,10 +157,26 @@ class WorldQuantBrainClient:
         with cls._auth_lock:
             if cls._shared_auth_ts and cls._shared_auth_ts > self._auth_snapshot_ts:
                 self._sync_shared_auth()
-                return
+                if self._recent_shared_auth():
+                    return
 
         last_response = None
         for attempt in range(1, max_retries + 1):
+            with cls._auth_lock:
+                if cls._shared_auth_ts and cls._shared_auth_ts > self._auth_snapshot_ts:
+                    self._sync_shared_auth()
+                    if self._recent_shared_auth():
+                        return
+                now = time.monotonic()
+                if self._last_auth_attempt_ts and now - self._last_auth_attempt_ts < self.auth_min_interval_sec:
+                    sleep_sec = max(0.5, self.auth_min_interval_sec - (now - self._last_auth_attempt_ts))
+                else:
+                    sleep_sec = 0.0
+                if sleep_sec > 0:
+                    logger.info("Auth throttled, waiting %.2fs before retry", sleep_sec)
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+            self._last_auth_attempt_ts = time.monotonic()
             try:
                 response = self.sess.post(
                     f"{self.base_url}/authentication",
@@ -160,10 +197,11 @@ class WorldQuantBrainClient:
                 token = response.headers.get("X-WQB-Session-Token")
                 if token:
                     self.sess.headers.update({"X-WQB-Session-Token": token})
-                cls._shared_headers = {"X-WQB-Session-Token": token} if token else {}
-                cls._shared_cookies = requests.utils.dict_from_cookiejar(self.sess.cookies)
-                cls._shared_auth_ts = time.monotonic()
-                self._auth_snapshot_ts = cls._shared_auth_ts
+                with cls._auth_lock:
+                    cls._shared_headers = {"X-WQB-Session-Token": token} if token else {}
+                    cls._shared_cookies = requests.utils.dict_from_cookiejar(self.sess.cookies)
+                    cls._shared_auth_ts = time.monotonic()
+                    self._auth_snapshot_ts = cls._shared_auth_ts
                 return
 
             if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
@@ -216,6 +254,7 @@ class WorldQuantBrainClient:
                 if attempt < max_retries:
                     sleep_sec = min(30, 2 ** (attempt - 1))
                     self._reset_session()
+                    self._note_connect_failure(sleep_sec)
                     logger.warning("Request error on %s %s (%s), retry in %ss", method, url, exc, sleep_sec)
                     time.sleep(sleep_sec)
                     continue
@@ -224,8 +263,13 @@ class WorldQuantBrainClient:
 
             if response.status_code == 401 and retry_auth and attempt < max_retries:
                 logger.warning("401 received on %s %s, re-authenticating and retrying", method, url)
-                self._reset_session()
-                self.authenticate()
+                if self._recent_shared_auth():
+                    sleep_sec = max(0.5, self.auth_min_interval_sec * 0.5)
+                    time.sleep(sleep_sec)
+                    self._sync_shared_auth()
+                else:
+                    self._reset_session()
+                    self.authenticate()
                 continue
 
             if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
