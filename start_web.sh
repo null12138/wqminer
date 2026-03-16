@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -17,8 +20,10 @@ if [[ -n "$LIBRARY" ]]; then
   args+=(--library "$LIBRARY")
 fi
 
-python3 "$ROOT/web_query.py" \
-  --config "$CONFIG" \
-  "${args[@]}" \
-  --host "$HOST" \
-  --port "$PORT"
+cmd=(python3 "$ROOT/web_query.py" --config "$CONFIG")
+if ((${#args[@]})); then
+  cmd+=("${args[@]}")
+fi
+cmd+=(--host "$HOST" --port "$PORT")
+
+"${cmd[@]}"

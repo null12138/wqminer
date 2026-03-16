@@ -59,6 +59,7 @@ def main() -> int:
         reverse_fitness_max=float(_get(cfg, "reverse_fitness_max", -1.0)),
         reverse_log=_get(cfg, "reverse_log", ""),
         negate_max_per_round=int(_get(cfg, "negate_max_per_round", 0)),
+        notify_url=_get(cfg, "notify_url", ""),
     )
 
     for path in summary.get("files", []):

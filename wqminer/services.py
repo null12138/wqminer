@@ -6,6 +6,8 @@ import json
 import logging
 import threading
 import time
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -362,12 +364,28 @@ def _evaluate_expressions(
                     "sharpe": float(result.sharpe),
                     "fitness": float(result.fitness),
                     "turnover": float(result.turnover),
+                    "alpha_id": result.alpha_id,
+                    "link": result.link,
                 }
             else:
-                row = {"expression": expr, "sharpe": 0.0, "fitness": 0.0, "turnover": 0.0}
+                row = {
+                    "expression": expr,
+                    "sharpe": 0.0,
+                    "fitness": 0.0,
+                    "turnover": 0.0,
+                    "alpha_id": "",
+                    "link": "",
+                }
         except Exception as exc:
             logging.warning("Simulation failed (%s/%s): %s", idx, total, exc)
-            row = {"expression": expr, "sharpe": 0.0, "fitness": 0.0, "turnover": 0.0}
+            row = {
+                "expression": expr,
+                "sharpe": 0.0,
+                "fitness": 0.0,
+                "turnover": 0.0,
+                "alpha_id": "",
+                "link": "",
+            }
         row["index"] = idx
         return row
 
@@ -403,6 +421,8 @@ def _write_results_json(path: Path, rows: Sequence[Dict[str, float]]) -> str:
             "sharpe": float(row.get("sharpe", 0.0)),
             "fitness": float(row.get("fitness", 0.0)),
             "turnover": float(row.get("turnover", 0.0)),
+            "alpha_id": str(row.get("alpha_id", "")).strip(),
+            "link": str(row.get("link", "")).strip(),
         }
         for row in rows
         if row.get("expression")
@@ -416,9 +436,9 @@ def _append_library(
     rows: Sequence[Dict[str, float]],
     sharpe_threshold: float,
     fitness_threshold: float,
-) -> int:
+) -> List[str]:
     if not library_path:
-        return 0
+        return []
     src = Path(library_path)
     existing: List[str] = []
     if src.exists():
@@ -444,12 +464,72 @@ def _append_library(
             added.append(expr)
 
     if not added:
-        return 0
+        return []
 
     merged = existing + added
     src.parent.mkdir(parents=True, exist_ok=True)
     src.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-    return len(added)
+    return added
+
+
+def _shorten_text(value: str, max_len: int = 140) -> str:
+    text = " ".join((value or "").split())
+    if max_len <= 0:
+        return text
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _build_notify_url(base_url: str, message: str) -> str:
+    raw = (base_url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if not parsed.scheme and parsed.path:
+        parsed = urlparse("https://" + raw)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["msg"] = message
+    new_query = urlencode(query, doseq=True)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+
+
+def _send_notify(base_url: str, message: str, timeout_sec: float = 6.0) -> bool:
+    url = _build_notify_url(base_url, message)
+    if not url:
+        return False
+    try:
+        req = Request(url, headers={"User-Agent": "wqminer/notify"})
+        with urlopen(req, timeout=timeout_sec) as resp:
+            resp.read(1024)
+        return True
+    except Exception as exc:
+        logging.warning("Notify failed: %s", exc)
+        return False
+
+
+def _format_notify_message(row: Dict[str, float], region: str, universe: str, delay: int, round_idx: int) -> str:
+    sharpe = float(row.get("sharpe", 0.0))
+    fitness = float(row.get("fitness", 0.0))
+    turnover = float(row.get("turnover", 0.0))
+    expr = _shorten_text(str(row.get("expression", "")), 120)
+    link = str(row.get("link", "")).strip()
+    alpha_id = str(row.get("alpha_id", "")).strip()
+    target = link or alpha_id
+    parts = [
+        f"region={region}",
+        f"universe={universe}",
+        f"delay={delay}",
+        f"round={round_idx}",
+        f"sharpe={sharpe:.3f}",
+        f"fitness={fitness:.3f}",
+        f"turnover={turnover:.2f}",
+    ]
+    if expr:
+        parts.append(f"expr={expr}")
+    if target:
+        parts.append(f"link={target}")
+    return " | ".join(parts)
 
 
 def run_one_click(
@@ -482,6 +562,7 @@ def run_one_click(
     reverse_fitness_max: float = -1.0,
     reverse_log: str = "",
     negate_max_per_round: int = 0,
+    notify_url: str = "",
     stop_event: Optional[threading.Event] = None,
 ) -> Dict:
     region = region.upper()
@@ -546,6 +627,8 @@ def run_one_click(
     results: List[Dict[str, float]] = []
     negated_seen: set = set()
     reverse_log_path = Path(reverse_log) if reverse_log else None
+    notify_url = (notify_url or "").strip()
+    notified_seen: set = set()
 
     try:
         while True:
@@ -590,7 +673,21 @@ def run_one_click(
                 )
                 results.extend(negated_results)
             files.append(_write_results_json(out_root / f"one_click_{ts}_round{round_idx:03}.json", results))
-            appended += _append_library(library_output, results, library_sharpe_min, library_fitness_min)
+            added = _append_library(library_output, results, library_sharpe_min, library_fitness_min)
+            appended += len(added)
+
+            if notify_url:
+                for row in results:
+                    expr = str(row.get("expression", "")).strip()
+                    if not expr or expr in notified_seen:
+                        continue
+                    if float(row.get("sharpe", 0.0)) < library_sharpe_min:
+                        continue
+                    if float(row.get("fitness", 0.0)) < library_fitness_min:
+                        continue
+                    message = _format_notify_message(row, region, universe, delay, round_idx)
+                    if _send_notify(notify_url, message):
+                        notified_seen.add(expr)
 
             reflection = generate_reflection_text(
                 llm_config_path=llm_config_path,

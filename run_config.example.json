@@ -13,6 +13,7 @@
   "library_output": "templates/library.json",
   "library_sharpe_min": 1.2,
   "library_fitness_min": 1.0,
+  "notify_url": "https://smarmoney.ryc.workers.dev/?msg=xxx",
   "reverse_sharpe_max": -1.2,
   "reverse_fitness_max": -1.0,
   "reverse_log": "results/one_click/reverse_flags.jsonl",
