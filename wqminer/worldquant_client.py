@@ -32,6 +32,7 @@ class WorldQuantBrainClient:
     BASE_URL = "https://api.worldquantbrain.com"
     PLATFORM_ALPHA_URL = "https://platform.worldquantbrain.com/alpha/"
     _global_lock = threading.Lock()
+    _auth_lock = threading.RLock()
     _global_last_request_ts = 0.0
     _global_last_meta_ts = 0.0
     _global_cooldown_until = 0.0
@@ -39,6 +40,9 @@ class WorldQuantBrainClient:
     _global_last_rate_limit_ts = 0.0
     _global_rate_limit_hits = 0
     _global_rate_limit_window_start = 0.0
+    _shared_auth_ts = 0.0
+    _shared_headers: Dict[str, str] = {}
+    _shared_cookies: Dict[str, str] = {}
 
     def __init__(
         self,
@@ -60,6 +64,20 @@ class WorldQuantBrainClient:
         self.request_jitter_sec = _env_float("WQMINER_REQUEST_JITTER", 0.0)
         self.metadata_min_interval_sec = _env_float("WQMINER_METADATA_MIN_INTERVAL", 0.0)
         self.metadata_jitter_sec = _env_float("WQMINER_METADATA_JITTER", 0.0)
+        self._auth_snapshot_ts = 0.0
+
+    def _sync_shared_auth(self) -> None:
+        cls = self.__class__
+        if cls._shared_auth_ts <= self._auth_snapshot_ts:
+            return
+        with cls._auth_lock:
+            if cls._shared_auth_ts <= self._auth_snapshot_ts:
+                return
+            if cls._shared_headers:
+                self.sess.headers.update(cls._shared_headers)
+            if cls._shared_cookies:
+                self.sess.cookies.update(cls._shared_cookies)
+            self._auth_snapshot_ts = cls._shared_auth_ts
 
     @classmethod
     def _throttle(cls, min_interval_sec: float, jitter_sec: float, bucket: str) -> None:
@@ -114,6 +132,12 @@ class WorldQuantBrainClient:
     def authenticate(self, max_retries: int = 5) -> None:
         if max_retries is None:
             max_retries = self.max_retries
+        cls = self.__class__
+        with cls._auth_lock:
+            if cls._shared_auth_ts and cls._shared_auth_ts > self._auth_snapshot_ts:
+                self._sync_shared_auth()
+                return
+
         last_response = None
         for attempt in range(1, max_retries + 1):
             try:
@@ -136,6 +160,10 @@ class WorldQuantBrainClient:
                 token = response.headers.get("X-WQB-Session-Token")
                 if token:
                     self.sess.headers.update({"X-WQB-Session-Token": token})
+                cls._shared_headers = {"X-WQB-Session-Token": token} if token else {}
+                cls._shared_cookies = requests.utils.dict_from_cookiejar(self.sess.cookies)
+                cls._shared_auth_ts = time.monotonic()
+                self._auth_snapshot_ts = cls._shared_auth_ts
                 return
 
             if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
@@ -176,6 +204,7 @@ class WorldQuantBrainClient:
         last_response = None
 
         for attempt in range(1, max_retries + 1):
+            self._sync_shared_auth()
             is_meta = any(token in url for token in ("/data-sets", "/data-fields", "/operators"))
             if is_meta:
                 self._throttle(self.metadata_min_interval_sec, self.metadata_jitter_sec, "meta")
@@ -195,6 +224,7 @@ class WorldQuantBrainClient:
 
             if response.status_code == 401 and retry_auth and attempt < max_retries:
                 logger.warning("401 received on %s %s, re-authenticating and retrying", method, url)
+                self._reset_session()
                 self.authenticate()
                 continue
 
@@ -240,6 +270,7 @@ class WorldQuantBrainClient:
         self.sess = requests.Session()
         self.sess.headers.update(headers)
         self.sess.auth = auth
+        self._sync_shared_auth()
 
     def get_datasets(
         self,

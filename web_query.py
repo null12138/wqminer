@@ -1032,6 +1032,7 @@ class FlowController:
                 evolve_rounds=int(_get(cfg, "evolve_rounds", 0)),
                 evolve_count=int(_get(cfg, "evolve_count", 0)),
                 evolve_top_k=int(_get(cfg, "evolve_top_k", 6)),
+                concurrency_cap=int(_get(cfg, "concurrency_cap", 0)),
                 seed_templates=_get(cfg, "seed_templates", ""),
                 library_output=library_output,
                 library_sharpe_min=float(_get(cfg, "library_sharpe_min", 1.2)),

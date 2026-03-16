@@ -327,6 +327,7 @@ def _evaluate_expressions(
     poll_interval_sec: int,
     max_wait_sec: int,
     concurrency: int,
+    concurrency_cap: int = 0,
 ) -> List[Dict[str, float]]:
     results: List[Dict[str, float]] = []
     total = len(expressions)
@@ -389,7 +390,10 @@ def _evaluate_expressions(
         row["index"] = idx
         return row
 
+    cap = int(concurrency_cap) if concurrency_cap else 0
     max_workers = max(1, min(int(concurrency), total))
+    if cap > 0:
+        max_workers = min(max_workers, cap)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(run_one, idx, expr)
@@ -554,6 +558,7 @@ def run_one_click(
     evolve_rounds: int = 0,
     evolve_count: int = 0,
     evolve_top_k: int = 6,
+    concurrency_cap: int = 0,
     seed_templates: str = "",
     library_output: str = "",
     library_sharpe_min: float = 1.2,
@@ -649,6 +654,7 @@ def run_one_click(
                 poll_interval_sec=poll_interval_sec,
                 max_wait_sec=max_wait_sec,
                 concurrency=concurrency,
+                concurrency_cap=concurrency_cap,
             )
             reverse_candidates = _collect_reverse_candidates(
                 results,
@@ -670,6 +676,7 @@ def run_one_click(
                     poll_interval_sec=poll_interval_sec,
                     max_wait_sec=max_wait_sec,
                     concurrency=concurrency,
+                    concurrency_cap=concurrency_cap,
                 )
                 results.extend(negated_results)
             files.append(_write_results_json(out_root / f"one_click_{ts}_round{round_idx:03}.json", results))
