@@ -56,6 +56,8 @@ class WorldQuantBrainClient:
     _auth_error_threshold = _env_int("WQMINER_AUTH_ERROR_THRESHOLD", 4)
     _auth_error_window_sec = _env_float("WQMINER_AUTH_ERROR_WINDOW", 60.0)
     _auth_error_cooldown_sec = _env_float("WQMINER_AUTH_ERROR_COOLDOWN", 12.0)
+    _inflight_limit = _env_int("WQMINER_MAX_INFLIGHT", 4)
+    _inflight_sem = threading.Semaphore(_inflight_limit) if _inflight_limit > 0 else None
     _consecutive_conn_errors = 0
     _last_conn_error_ts = 0.0
     _consecutive_auth_errors = 0
@@ -258,6 +260,7 @@ class WorldQuantBrainClient:
                     cls._shared_cookies = requests.utils.dict_from_cookiejar(self.sess.cookies)
                     cls._shared_auth_ts = time.monotonic()
                     self._auth_snapshot_ts = cls._shared_auth_ts
+                cls._reset_error_counters(conn=False, auth=True)
                 return
 
             if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
@@ -305,7 +308,12 @@ class WorldQuantBrainClient:
             else:
                 self._throttle(self.min_request_interval_sec, self.request_jitter_sec, "global")
             try:
-                response = self.sess.request(method, url, timeout=self.timeout_sec, **kwargs)
+                sem = self.__class__._inflight_sem
+                if sem is None:
+                    response = self.sess.request(method, url, timeout=self.timeout_sec, **kwargs)
+                else:
+                    with sem:
+                        response = self.sess.request(method, url, timeout=self.timeout_sec, **kwargs)
             except requests.RequestException as exc:
                 if attempt < max_retries:
                     sleep_sec = min(30, 2 ** (attempt - 1))

@@ -375,6 +375,7 @@ def _evaluate_expressions(
                     "turnover": float(result.turnover),
                     "alpha_id": result.alpha_id,
                     "link": result.link,
+                    "success": True,
                 }
             else:
                 row = {
@@ -384,6 +385,7 @@ def _evaluate_expressions(
                     "turnover": 0.0,
                     "alpha_id": "",
                     "link": "",
+                    "success": False,
                 }
         except Exception as exc:
             logging.warning("Simulation failed (%s/%s): %s", idx, total, exc)
@@ -394,6 +396,7 @@ def _evaluate_expressions(
                 "turnover": 0.0,
                 "alpha_id": "",
                 "link": "",
+                "success": False,
             }
         row["index"] = idx
         return row
@@ -435,6 +438,7 @@ def _write_results_json(path: Path, rows: Sequence[Dict[str, float]]) -> str:
             "turnover": float(row.get("turnover", 0.0)),
             "alpha_id": str(row.get("alpha_id", "")).strip(),
             "link": str(row.get("link", "")).strip(),
+            "success": bool(row.get("success", False)),
         }
         for row in rows
         if row.get("expression")
@@ -528,20 +532,16 @@ def _format_notify_message(row: Dict[str, float], region: str, universe: str, de
     link = str(row.get("link", "")).strip()
     alpha_id = str(row.get("alpha_id", "")).strip()
     target = link or alpha_id
-    parts = [
-        f"region={region}",
-        f"universe={universe}",
-        f"delay={delay}",
-        f"round={round_idx}",
-        f"sharpe={sharpe:.3f}",
-        f"fitness={fitness:.3f}",
-        f"turnover={turnover:.2f}",
+    lines = [
+        "WQMiner | Alpha Submitted",
+        f"Sharpe: {sharpe:.3f} | Fitness: {fitness:.3f} | Turnover: {turnover:.2f}",
+        f"Region/Universe/Delay: {region}/{universe}/{delay} | Round: {round_idx}",
     ]
     if expr:
-        parts.append(f"expr={expr}")
+        lines.append(f"Expr: {expr}")
     if target:
-        parts.append(f"link={target}")
-    return " | ".join(parts)
+        lines.append(f"Link: {target}")
+    return "\n".join(lines)
 
 
 def run_one_click(
@@ -693,12 +693,12 @@ def run_one_click(
 
             if notify_url:
                 for row in results:
+                    if not row.get("success"):
+                        continue
                     expr = str(row.get("expression", "")).strip()
                     if not expr or expr in notified_seen:
                         continue
-                    if float(row.get("sharpe", 0.0)) < library_sharpe_min:
-                        continue
-                    if float(row.get("fitness", 0.0)) < library_fitness_min:
+                    if not row.get("link") and not row.get("alpha_id"):
                         continue
                     message = _format_notify_message(row, region, universe, delay, round_idx)
                     if _send_notify(notify_url, message):
