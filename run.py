@@ -42,6 +42,7 @@ def main() -> int:
         inspiration=_get(cfg, "inspiration", ""),
         output_dir=_get(cfg, "output_dir", "results/one_click"),
         concurrency=int(_get(cfg, "concurrency", 3)),
+        async_mode=bool(_get(cfg, "async_mode", False)),
         timeout_sec=int(_get(cfg, "timeout_sec", 60)),
         max_retries=int(_get(cfg, "max_retries", 5)),
         poll_interval_sec=int(_get(cfg, "poll_interval", 30)),

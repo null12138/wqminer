@@ -20,6 +20,7 @@
   "negate_max_per_round": 6,
   "output_dir": "results/one_click",
   "concurrency": 3,
+  "async_mode": false,
   "concurrency_cap": 5,
   "timeout_sec": 90,
   "max_retries": 8,

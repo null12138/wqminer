@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -56,18 +57,19 @@ def generate_inspiration_text(
 
     system_prompt = (
         "You are a quantitative alpha researcher. "
-        "Generate a concise research inspiration for FASTEXPR templates. "
-        "Output plain text only."
+        "Write a concise, actionable alpha hypothesis that can be translated into FASTEXPR. "
+        "Output plain text only (no lists, no code)."
     )
     user_prompt = (
         f"Region: {region}\n"
         f"Universe: {universe or 'default'}\n"
         f"Delay: {delay}\n"
-        "Task: Provide 1-2 short inspiration ideas to guide alpha template generation.\n"
+        "Task: Provide 1-2 short sentences guiding alpha template generation.\n"
         "Constraints:\n"
-        "- Avoid code, avoid bullet lists.\n"
-        "- Keep it under 3 sentences.\n"
-        "- Be specific about signal intuition.\n"
+        "- No bullet lists, no code.\n"
+        "- 1-2 sentences only, under 320 characters.\n"
+        "- Be specific about signal intuition and intended effect (e.g., value, momentum, quality, sentiment, risk).\n"
+        "- Mention at least one concrete field type or dataset category when possible.\n"
     )
     if seed_expressions:
         samples = [x.strip() for x in seed_expressions if x and x.strip()]
@@ -280,8 +282,8 @@ def generate_reflection_text(
 
     system_prompt = (
         "You are a quantitative alpha researcher. "
-        "Provide a brief reflection and next-step guidance. "
-        "No chain-of-thought. Keep it under 3 sentences."
+        "Provide a brief reflection and specific next-step guidance. "
+        "No chain-of-thought. 1-2 sentences only."
     )
     user_prompt = (
         f"Round: {round_index}\n"
@@ -294,7 +296,7 @@ def generate_reflection_text(
         f"Avg turnover: {summary['avg_turnover']:.2f}\n"
         "Top expressions:\n"
         + ("\n".join(lines) if lines else "none")
-        + "\n\nReturn a short reflection and next guidance."
+        + "\n\nReturn 1-2 sentences: diagnose performance and suggest concrete operator/field directions."
     )
 
     try:
@@ -339,6 +341,7 @@ def _evaluate_expressions(
     progress_cb: Optional[Callable[[Dict], None]] = None,
     round_idx: int = 0,
     stage: str = "simulate",
+    row_cb: Optional[Callable[[Dict], None]] = None,
 ) -> List[Dict[str, float]]:
     results: List[Dict[str, float]] = []
     total = len(expressions)
@@ -402,6 +405,8 @@ def _evaluate_expressions(
                 "success": False,
             }
         row["index"] = idx
+        if row_cb:
+            row_cb(row)
         return row
 
     cap = int(concurrency_cap) if concurrency_cap else 0
@@ -456,6 +461,160 @@ def _evaluate_expressions(
                     }
                 )
 
+    results_sorted = sorted(results, key=lambda x: int(x.get("index", 0)))
+    for row in results_sorted:
+        logging.info(
+            "Simulated %s/%s sharpe=%.3f fitness=%.3f turnover=%.2f",
+            row.get("index", 0),
+            total,
+            row.get("sharpe", 0.0),
+            row.get("fitness", 0.0),
+            row.get("turnover", 0.0),
+        )
+        row.pop("index", None)
+
+    return results_sorted
+
+
+def _evaluate_expressions_async(
+    username: str,
+    password: str,
+    timeout_sec: int,
+    max_retries: int,
+    expressions: Sequence[str],
+    settings: SimulationSettings,
+    poll_interval_sec: int,
+    max_wait_sec: int,
+    concurrency: int,
+    concurrency_cap: int = 0,
+    progress_cb: Optional[Callable[[Dict], None]] = None,
+    round_idx: int = 0,
+    stage: str = "simulate",
+    row_cb: Optional[Callable[[Dict], None]] = None,
+) -> List[Dict[str, float]]:
+    results: List[Dict[str, float]] = []
+    total = len(expressions)
+    if total == 0:
+        return results
+
+    seed = WorldQuantBrainClient(
+        username=username,
+        password=password,
+        timeout_sec=max(5, int(timeout_sec)),
+        max_retries=max(1, int(max_retries)),
+    )
+    seed.authenticate()
+
+    completed = 0
+    success = 0
+    failed = 0
+    if progress_cb:
+        progress_cb(
+            {
+                "stage": stage,
+                "round": round_idx,
+                "total": total,
+                "completed": 0,
+                "success": 0,
+                "failed": 0,
+                "last": {},
+            }
+        )
+
+    max_workers = max(1, min(int(concurrency), total))
+    cap = int(concurrency_cap) if concurrency_cap else 0
+    if cap > 0:
+        max_workers = min(max_workers, cap)
+
+    def run_one(idx: int, expr: str) -> Dict[str, float]:
+        try:
+            client = WorldQuantBrainClient(
+                username=username,
+                password=password,
+                timeout_sec=max(5, int(timeout_sec)),
+                max_retries=max(1, int(max_retries)),
+            )
+            result = client.simulate_expression(
+                expression=expr,
+                settings=settings,
+                poll_interval_sec=max(1, int(poll_interval_sec)),
+                max_wait_sec=max(30, int(max_wait_sec)),
+            )
+            if result.success:
+                row = {
+                    "expression": expr,
+                    "sharpe": float(result.sharpe),
+                    "fitness": float(result.fitness),
+                    "turnover": float(result.turnover),
+                    "alpha_id": result.alpha_id,
+                    "link": result.link,
+                    "success": True,
+                }
+            else:
+                row = {
+                    "expression": expr,
+                    "sharpe": 0.0,
+                    "fitness": 0.0,
+                    "turnover": 0.0,
+                    "alpha_id": "",
+                    "link": "",
+                    "success": False,
+                }
+        except Exception as exc:
+            logging.warning("Simulation failed (%s/%s): %s", idx, total, exc)
+            row = {
+                "expression": expr,
+                "sharpe": 0.0,
+                "fitness": 0.0,
+                "turnover": 0.0,
+                "alpha_id": "",
+                "link": "",
+                "success": False,
+            }
+        row["index"] = idx
+        if row_cb:
+            row_cb(row)
+        return row
+
+    async def runner() -> List[Dict[str, float]]:
+        nonlocal completed, success, failed
+        sem = asyncio.Semaphore(max_workers)
+
+        async def run_one_async(idx: int, expr: str) -> Dict[str, float]:
+            async with sem:
+                return await asyncio.to_thread(run_one, idx, expr)
+
+        tasks = [asyncio.create_task(run_one_async(idx, expr)) for idx, expr in enumerate(expressions, start=1)]
+        out: List[Dict[str, float]] = []
+        for fut in asyncio.as_completed(tasks):
+            row = await fut
+            out.append(row)
+            completed += 1
+            if row.get("success"):
+                success += 1
+            else:
+                failed += 1
+            if progress_cb:
+                progress_cb(
+                    {
+                        "stage": stage,
+                        "round": round_idx,
+                        "total": total,
+                        "completed": completed,
+                        "success": success,
+                        "failed": failed,
+                        "last": {
+                            "expression": row.get("expression", ""),
+                            "sharpe": row.get("sharpe", 0.0),
+                            "fitness": row.get("fitness", 0.0),
+                            "turnover": row.get("turnover", 0.0),
+                            "alpha_id": row.get("alpha_id", ""),
+                        },
+                    }
+                )
+        return out
+
+    results = asyncio.run(runner())
     results_sorted = sorted(results, key=lambda x: int(x.get("index", 0)))
     for row in results_sorted:
         logging.info(
@@ -581,20 +740,45 @@ def _format_notify_message(row: Dict[str, float], region: str, universe: str, de
     sharpe = float(row.get("sharpe", 0.0))
     fitness = float(row.get("fitness", 0.0))
     turnover = float(row.get("turnover", 0.0))
-    expr = _shorten_text(str(row.get("expression", "")), 120)
     link = str(row.get("link", "")).strip()
     alpha_id = str(row.get("alpha_id", "")).strip()
-    target = link or alpha_id
+    if not link and alpha_id:
+        link = f"https://platform.worldquantbrain.com/alpha/{alpha_id}"
     lines = [
-        "WQMiner | Alpha Submitted",
-        f"Sharpe: {sharpe:.3f} | Fitness: {fitness:.3f} | Turnover: {turnover:.2f}",
-        f"Region/Universe/Delay: {region}/{universe}/{delay} | Round: {round_idx}",
+        f"sharpe={sharpe:.3f} fitness={fitness:.3f} turnover={turnover:.2f}",
+        f"link={link}" if link else "link=",
     ]
-    if expr:
-        lines.append(f"Expr: {expr}")
-    if target:
-        lines.append(f"Link: {target}")
     return "\n".join(lines)
+
+
+def _maybe_notify_row(
+    row: Dict[str, float],
+    region: str,
+    universe: str,
+    delay: int,
+    round_idx: int,
+    notify_url: str,
+    notified_seen: set,
+) -> None:
+    if not notify_url:
+        return
+    if not row.get("success"):
+        return
+    alpha_id = str(row.get("alpha_id", "")).strip()
+    expr = str(row.get("expression", "")).strip()
+    link = str(row.get("link", "")).strip()
+    if not link and alpha_id:
+        link = f"https://platform.worldquantbrain.com/alpha/{alpha_id}"
+    key = alpha_id or expr
+    if not key or key in notified_seen or not link:
+        return
+    row_view = dict(row)
+    row_view["link"] = link
+    row_view["alpha_id"] = alpha_id
+    message = _format_notify_message(row_view, region, universe, delay, round_idx)
+    if _send_notify(notify_url, message):
+        notified_seen.add(key)
+        logging.info("Notify sent: %s", key)
 
 
 def run_one_click(
@@ -610,6 +794,7 @@ def run_one_click(
     inspiration: str = "",
     output_dir: str = "results/one_click",
     concurrency: int = 3,
+    async_mode: bool = False,
     timeout_sec: int = 60,
     max_retries: int = 5,
     poll_interval_sec: int = 30,
@@ -700,6 +885,7 @@ def run_one_click(
     else:
         logging.info("Notify disabled: no notify_url configured")
     notified_seen: set = set()
+    evaluator = _evaluate_expressions_async if async_mode else _evaluate_expressions
 
     try:
         if progress_cb:
@@ -714,7 +900,9 @@ def run_one_click(
             if progress_cb:
                 progress_cb({"stage": "generate", "round": round_idx, "total": 0, "completed": 0, "success": 0, "failed": 0, "last": {}})
             expressions = _generate_expressions(generator, region, fields, per_round, style)
-            results = _evaluate_expressions(
+            def row_cb(row: Dict[str, float]) -> None:
+                _maybe_notify_row(row, region, universe, delay, round_idx, notify_url, notified_seen)
+            results = evaluator(
                 username=user,
                 password=pwd,
                 timeout_sec=timeout_sec,
@@ -728,6 +916,7 @@ def run_one_click(
                 progress_cb=progress_cb,
                 round_idx=round_idx,
                 stage="simulate",
+                row_cb=row_cb,
             )
             reverse_candidates = _collect_reverse_candidates(
                 results,
@@ -739,7 +928,7 @@ def run_one_click(
             )
             if reverse_candidates:
                 logging.info("Reverse factors detected: %d, evaluating negated expressions", len(reverse_candidates))
-                negated_results = _evaluate_expressions(
+                negated_results = evaluator(
                     username=user,
                     password=pwd,
                     timeout_sec=timeout_sec,
@@ -753,27 +942,12 @@ def run_one_click(
                     progress_cb=progress_cb,
                     round_idx=round_idx,
                     stage="negate",
+                    row_cb=row_cb,
                 )
                 results.extend(negated_results)
             files.append(_write_results_json(out_root / f"one_click_{ts}_round{round_idx:03}.json", results))
             added = _append_library(library_output, results, library_sharpe_min, library_fitness_min)
             appended += len(added)
-
-            if notify_url:
-                for row in results:
-                    if not row.get("success"):
-                        continue
-                    expr = str(row.get("expression", "")).strip()
-                    alpha_id = str(row.get("alpha_id", "")).strip()
-                    key = alpha_id or expr
-                    if not key or key in notified_seen:
-                        continue
-                    if not row.get("link") and not alpha_id:
-                        continue
-                    message = _format_notify_message(row, region, universe, delay, round_idx)
-                    if _send_notify(notify_url, message):
-                        notified_seen.add(key)
-                        logging.info("Notify sent: %s", key)
 
             reflection = generate_reflection_text(
                 llm_config_path=llm_config_path,

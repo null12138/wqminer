@@ -41,17 +41,22 @@ class TemplateGenerator:
         field_lines = [f"- {f.field_id}: {f.description or 'no description'}" for f in sampled_fields]
 
         system_prompt = (
-            "You are a WorldQuant Brain FASTEXPR alpha researcher. "
-            "Generate only valid alpha expressions and output one expression per line."
+            "You are a WorldQuant Brain FASTEXPR specialist. "
+            "Output ONLY valid FASTEXPR expressions, one per line. "
+            "No numbering, no markdown, no extra text."
         )
 
         user_prompt = (
             f"Region: {region}\n"
-            f"Generate {count} diverse FASTEXPR alpha templates.\n"
-            "Use only provided operators and fields.\n"
-            "Each expression must be syntactically complete and balanced.\n"
-            "Avoid explanations and markdown.\n"
-            f"Additional style requirements: {style_prompt or 'none'}\n\n"
+            f"Task: Generate exactly {count} diverse FASTEXPR alpha expressions.\n"
+            "Hard constraints:\n"
+            "- Use ONLY the operators listed below (names must match exactly).\n"
+            "- Use ONLY the field IDs listed below (spelling must match exactly).\n"
+            "- Each line must be a complete, balanced expression.\n"
+            "- Avoid undefined identifiers and avoid empty/constant-only expressions.\n"
+            "- Keep each expression under 200 characters.\n"
+            f"- If style requirements conflict with the constraints, ignore them.\n"
+            f"Style requirements: {style_prompt or 'none'}\n\n"
             "Operators:\n"
             + "\n".join(operator_lines)
             + "\n\nData fields:\n"
