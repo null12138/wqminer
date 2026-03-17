@@ -1020,41 +1020,67 @@ class WorldQuantBrainClient:
         poll_interval_sec: int = 5,
         max_wait_sec: int = 600,
     ) -> SimulationResult:
-        submit = self._request("POST", "/simulations", json=settings.to_api_payload(expression))
-        if submit.status_code != 201:
+        return asyncio.run(
+            self.async_simulate_expression(
+                expression=expression,
+                settings=settings,
+                poll_interval_sec=poll_interval_sec,
+                max_wait_sec=max_wait_sec,
+            )
+        )
+
+    def check_alpha(
+        self,
+        alpha_id: str,
+        *,
+        max_tries: int | Iterable[int] = 600,
+    ) -> requests.Response:
+        return self._retry_with_retry_after("GET", f"/alphas/{alpha_id}/check", max_tries=max_tries)
+
+    def submit_alpha(
+        self,
+        alpha_id: str,
+        *,
+        max_tries: int | Iterable[int] = 600,
+        allow_http_fallback: bool = True,
+    ) -> requests.Response:
+        resp = self._retry_with_retry_after("POST", f"/alphas/{alpha_id}/submit", max_tries=max_tries)
+        if not allow_http_fallback:
+            return resp
+        if resp.status_code in (404, 405) and "api.worldquantbrain.com" in self.base_url:
+            fallback_url = f"http://api.worldquantbrain.com:443/alphas/{alpha_id}/submit"
+            return self._retry_with_retry_after("POST", fallback_url, max_tries=max_tries)
+        return resp
+
+    async def async_simulate_expression(
+        self,
+        expression: str,
+        settings: SimulationSettings,
+        poll_interval_sec: int = 5,
+        max_wait_sec: int = 600,
+    ) -> SimulationResult:
+        payload = settings.to_api_payload(expression)
+        max_tries = _max_tries_from_wait(max_wait_sec, poll_interval_sec)
+        resp = await self.sess.simulate(
+            payload,
+            max_tries=range(max_tries),
+            delay_key_error=float(max(1, int(poll_interval_sec))),
+            delay_value_error=float(max(1, int(poll_interval_sec))),
+        )
+        if resp is None or resp.status_code not in (200, 201):
             return SimulationResult(
                 expression=expression,
                 alpha_id="",
                 success=False,
-                error_message=f"submit_failed: {submit.status_code} {submit.text}",
+                error_message=f"submit_failed: {getattr(resp, 'status_code', 'no_response')}",
             )
-
-        location = submit.headers.get("Location", "")
-        if not location:
-            return SimulationResult(
-                expression=expression,
-                alpha_id="",
-                success=False,
-                error_message="submit_failed: missing Location header",
-            )
-
-        progress_url = location if location.startswith("http") else urljoin(f"{self.base_url}/", location.lstrip("/"))
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
         alpha_id = ""
-        deadline = time.time() + max_wait_sec
-
-        while time.time() < deadline:
-            progress = self._request("GET", progress_url)
-            if progress.status_code != 200:
-                retry_after = self._parse_retry_after(progress)
-                time.sleep(retry_after if retry_after is not None else max(1.0, float(poll_interval_sec)))
-                continue
-            body = progress.json()
-            if "alpha" in body and body["alpha"]:
-                alpha_id = str(body["alpha"]).rstrip("/").split("/")[-1]
-                break
-            retry_after = self._parse_retry_after(progress)
-            time.sleep(retry_after if retry_after is not None else max(1.0, float(poll_interval_sec)))
-
+        if isinstance(body, dict) and body.get("alpha"):
+            alpha_id = str(body["alpha"]).rstrip("/").split("/")[-1]
         if not alpha_id:
             return SimulationResult(
                 expression=expression,
@@ -1062,8 +1088,7 @@ class WorldQuantBrainClient:
                 success=False,
                 error_message="simulation_timeout",
             )
-
-        detail = self._request("GET", f"/alphas/{alpha_id}")
+        detail = await asyncio.to_thread(self._request, "GET", f"/alphas/{alpha_id}")
         if detail.status_code != 200:
             return SimulationResult(
                 expression=expression,
@@ -1071,7 +1096,6 @@ class WorldQuantBrainClient:
                 success=False,
                 error_message=f"detail_failed: {detail.status_code} {detail.text}",
             )
-
         payload = detail.json()
         is_block = payload.get("is", {})
         checks = is_block.get("checks", [])
@@ -1105,46 +1129,12 @@ class WorldQuantBrainClient:
             link=f"{self.PLATFORM_ALPHA_URL}{alpha_id}",
         )
 
-    def check_alpha(
-        self,
-        alpha_id: str,
-        *,
-        max_tries: int | Iterable[int] = 600,
-    ) -> requests.Response:
-        return self._retry_with_retry_after("GET", f"/alphas/{alpha_id}/check", max_tries=max_tries)
-
-    def submit_alpha(
-        self,
-        alpha_id: str,
-        *,
-        max_tries: int | Iterable[int] = 600,
-        allow_http_fallback: bool = True,
-    ) -> requests.Response:
-        resp = self._retry_with_retry_after("POST", f"/alphas/{alpha_id}/submit", max_tries=max_tries)
-        if not allow_http_fallback:
-            return resp
-        if resp.status_code in (404, 405) and "api.worldquantbrain.com" in self.base_url:
-            fallback_url = f"http://api.worldquantbrain.com:443/alphas/{alpha_id}/submit"
-            return self._retry_with_retry_after("POST", fallback_url, max_tries=max_tries)
-        return resp
-
-    async def async_simulate_expression(
-        self,
-        expression: str,
-        settings: SimulationSettings,
-        poll_interval_sec: int = 5,
-        max_wait_sec: int = 600,
-    ) -> SimulationResult:
-        return await asyncio.to_thread(
-            self.simulate_expression,
-            expression,
-            settings,
-            poll_interval_sec,
-            max_wait_sec,
-        )
-
     async def async_check_alpha(self, alpha_id: str, *, max_tries: int | Iterable[int] = 600) -> requests.Response:
-        return await asyncio.to_thread(self.check_alpha, alpha_id, max_tries=max_tries)
+        tries = max_tries if not isinstance(max_tries, int) else range(int(max_tries))
+        resp = await self.sess.check(alpha_id, max_tries=tries)
+        if resp is None:
+            raise RuntimeError("check_alpha returned no response")
+        return resp
 
     async def async_submit_alpha(
         self,
@@ -1153,12 +1143,16 @@ class WorldQuantBrainClient:
         max_tries: int | Iterable[int] = 600,
         allow_http_fallback: bool = True,
     ) -> requests.Response:
-        return await asyncio.to_thread(
-            self.submit_alpha,
-            alpha_id,
-            max_tries=max_tries,
-            allow_http_fallback=allow_http_fallback,
-        )
+        tries = max_tries if not isinstance(max_tries, int) else range(int(max_tries))
+        resp = await self.sess.submit(alpha_id, max_tries=tries)
+        if resp is None:
+            raise RuntimeError("submit_alpha returned no response")
+        if not allow_http_fallback:
+            return resp
+        if resp.status_code in (404, 405) and "api.worldquantbrain.com" in self.base_url:
+            fallback_url = f"http://api.worldquantbrain.com:443/alphas/{alpha_id}/submit"
+            return self._retry_with_retry_after("POST", fallback_url, max_tries=max_tries)
+        return resp
 
     async def concurrent_simulate_expressions(
         self,
@@ -1175,8 +1169,7 @@ class WorldQuantBrainClient:
 
         async def run_one(expr: str) -> SimulationResult:
             async with sem:
-                return await asyncio.to_thread(
-                    self._clone_client().simulate_expression,
+                return await self._clone_client().async_simulate_expression(
                     expr,
                     settings,
                     poll_interval_sec,
@@ -1199,7 +1192,7 @@ class WorldQuantBrainClient:
 
         async def run_one(alpha_id: str) -> requests.Response:
             async with sem:
-                return await asyncio.to_thread(self._clone_client().check_alpha, alpha_id, max_tries=max_tries)
+                return await self._clone_client().async_check_alpha(alpha_id, max_tries=max_tries)
 
         tasks = [asyncio.create_task(run_one(alpha_id)) for alpha_id in alpha_ids]
         return await asyncio.gather(*tasks, return_exceptions=return_exceptions)
@@ -1218,8 +1211,7 @@ class WorldQuantBrainClient:
 
         async def run_one(alpha_id: str) -> requests.Response:
             async with sem:
-                return await asyncio.to_thread(
-                    self._clone_client().submit_alpha,
+                return await self._clone_client().async_submit_alpha(
                     alpha_id,
                     max_tries=max_tries,
                     allow_http_fallback=allow_http_fallback,
@@ -1234,6 +1226,12 @@ def _to_float(value) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _max_tries_from_wait(max_wait_sec: int, poll_interval_sec: int) -> int:
+    poll = max(1, int(poll_interval_sec))
+    wait = max(poll, int(max_wait_sec))
+    return max(1, wait // poll)
 
 
 def _env_flag(name: str) -> bool:

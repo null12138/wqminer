@@ -361,137 +361,23 @@ def _evaluate_expressions(
     stage: str = "simulate",
     row_cb: Optional[Callable[[Dict], None]] = None,
 ) -> List[Dict[str, float]]:
-    results: List[Dict[str, float]] = []
-    total = len(expressions)
-    if total == 0:
-        return results
-
-    seed = WorldQuantBrainClient(
+    return _evaluate_expressions_async(
         username=username,
         password=password,
-        timeout_sec=max(5, int(timeout_sec)),
-        max_retries=max(1, int(max_retries)),
+        timeout_sec=timeout_sec,
+        max_retries=max_retries,
+        expressions=expressions,
+        settings=settings,
+        poll_interval_sec=poll_interval_sec,
+        max_wait_sec=max_wait_sec,
+        concurrency=concurrency,
+        concurrency_cap=concurrency_cap,
         disable_proxy=disable_proxy,
+        progress_cb=progress_cb,
+        round_idx=round_idx,
+        stage=stage,
+        row_cb=row_cb,
     )
-    seed.authenticate()
-    local = threading.local()
-
-    def get_client() -> WorldQuantBrainClient:
-        client = getattr(local, "client", None)
-        if client is None:
-            client = seed._clone_client()
-            local.client = client
-        return client
-
-    def run_one(idx: int, expr: str) -> Dict[str, float]:
-        try:
-            result = get_client().simulate_expression(
-                expression=expr,
-                settings=settings,
-                poll_interval_sec=max(1, int(poll_interval_sec)),
-                max_wait_sec=max(30, int(max_wait_sec)),
-            )
-            if result.success:
-                row = {
-                    "expression": expr,
-                    "sharpe": float(result.sharpe),
-                    "fitness": float(result.fitness),
-                    "turnover": float(result.turnover),
-                    "alpha_id": result.alpha_id,
-                    "link": result.link,
-                    "success": True,
-                }
-            else:
-                row = {
-                    "expression": expr,
-                    "sharpe": 0.0,
-                    "fitness": 0.0,
-                    "turnover": 0.0,
-                    "alpha_id": "",
-                    "link": "",
-                    "success": False,
-                }
-        except Exception as exc:
-            logging.warning("Simulation failed (%s/%s): %s", idx, total, exc)
-            row = {
-                "expression": expr,
-                "sharpe": 0.0,
-                "fitness": 0.0,
-                "turnover": 0.0,
-                "alpha_id": "",
-                "link": "",
-                "success": False,
-            }
-        row["index"] = idx
-        if row_cb:
-            row_cb(row)
-        return row
-
-    cap = int(concurrency_cap) if concurrency_cap else 0
-    completed = 0
-    success = 0
-    failed = 0
-    if progress_cb:
-        progress_cb(
-            {
-                "stage": stage,
-                "round": round_idx,
-                "total": total,
-                "completed": 0,
-                "success": 0,
-                "failed": 0,
-                "last": {},
-            }
-        )
-
-    max_workers = max(1, min(int(concurrency), total))
-    if cap > 0:
-        max_workers = min(max_workers, cap)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(run_one, idx, expr)
-            for idx, expr in enumerate(expressions, start=1)
-        ]
-        for fut in as_completed(futures):
-            row = fut.result()
-            results.append(row)
-            completed += 1
-            if row.get("success"):
-                success += 1
-            else:
-                failed += 1
-            if progress_cb:
-                progress_cb(
-                    {
-                        "stage": stage,
-                        "round": round_idx,
-                        "total": total,
-                        "completed": completed,
-                        "success": success,
-                        "failed": failed,
-                        "last": {
-                            "expression": row.get("expression", ""),
-                            "sharpe": row.get("sharpe", 0.0),
-                            "fitness": row.get("fitness", 0.0),
-                            "turnover": row.get("turnover", 0.0),
-                            "alpha_id": row.get("alpha_id", ""),
-                        },
-                    }
-                )
-
-    results_sorted = sorted(results, key=lambda x: int(x.get("index", 0)))
-    for row in results_sorted:
-        logging.info(
-            "Simulated %s/%s sharpe=%.3f fitness=%.3f turnover=%.2f",
-            row.get("index", 0),
-            total,
-            row.get("sharpe", 0.0),
-            row.get("fitness", 0.0),
-            row.get("turnover", 0.0),
-        )
-        row.pop("index", None)
-
-    return results_sorted
 
 
 def _retry_failed_expressions(
@@ -556,14 +442,6 @@ def _evaluate_expressions_async(
         disable_proxy=disable_proxy,
     )
     seed.authenticate()
-    local = threading.local()
-
-    def get_client() -> WorldQuantBrainClient:
-        client = getattr(local, "client", None)
-        if client is None:
-            client = seed._clone_client()
-            local.client = client
-        return client
 
     completed = 0
     success = 0
@@ -586,9 +464,9 @@ def _evaluate_expressions_async(
     if cap > 0:
         max_workers = min(max_workers, cap)
 
-    def run_one(idx: int, expr: str) -> Dict[str, float]:
+    async def run_one(idx: int, expr: str) -> Dict[str, float]:
         try:
-            result = get_client().simulate_expression(
+            result = await seed._clone_client().async_simulate_expression(
                 expression=expr,
                 settings=settings,
                 poll_interval_sec=max(1, int(poll_interval_sec)),
@@ -636,7 +514,7 @@ def _evaluate_expressions_async(
 
         async def run_one_async(idx: int, expr: str) -> Dict[str, float]:
             async with sem:
-                return await asyncio.to_thread(run_one, idx, expr)
+                return await run_one(idx, expr)
 
         tasks = [asyncio.create_task(run_one_async(idx, expr)) for idx, expr in enumerate(expressions, start=1)]
         out: List[Dict[str, float]] = []
