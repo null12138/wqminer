@@ -510,18 +510,28 @@ def _build_notify_url(base_url: str, message: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
 
 
-def _send_notify(base_url: str, message: str, timeout_sec: float = 6.0) -> bool:
+def _send_notify(
+    base_url: str,
+    message: str,
+    timeout_sec: float = 6.0,
+    max_retries: int = 3,
+) -> bool:
     url = _build_notify_url(base_url, message)
     if not url:
         return False
-    try:
-        req = Request(url, headers={"User-Agent": "wqminer/notify"})
-        with urlopen(req, timeout=timeout_sec) as resp:
-            resp.read(1024)
-        return True
-    except Exception as exc:
-        logging.warning("Notify failed: %s", exc)
-        return False
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = Request(url, headers={"User-Agent": "wqminer/notify"})
+            with urlopen(req, timeout=timeout_sec) as resp:
+                resp.read(1024)
+            return True
+        except Exception as exc:
+            if attempt >= max_retries:
+                logging.warning("Notify failed: %s", exc)
+                return False
+            backoff = min(6, 2 ** (attempt - 1))
+            time.sleep(backoff)
+    return False
 
 
 def _format_notify_message(row: Dict[str, float], region: str, universe: str, delay: int, round_idx: int) -> str:
@@ -641,6 +651,10 @@ def run_one_click(
     negated_seen: set = set()
     reverse_log_path = Path(reverse_log) if reverse_log else None
     notify_url = (notify_url or "").strip()
+    if notify_url:
+        logging.info("Notify enabled: %s", notify_url.split("?")[0])
+    else:
+        logging.info("Notify disabled: no notify_url configured")
     notified_seen: set = set()
 
     try:
@@ -696,13 +710,16 @@ def run_one_click(
                     if not row.get("success"):
                         continue
                     expr = str(row.get("expression", "")).strip()
-                    if not expr or expr in notified_seen:
+                    alpha_id = str(row.get("alpha_id", "")).strip()
+                    key = alpha_id or expr
+                    if not key or key in notified_seen:
                         continue
-                    if not row.get("link") and not row.get("alpha_id"):
+                    if not row.get("link") and not alpha_id:
                         continue
                     message = _format_notify_message(row, region, universe, delay, round_idx)
                     if _send_notify(notify_url, message):
-                        notified_seen.add(expr)
+                        notified_seen.add(key)
+                        logging.info("Notify sent: %s", key)
 
             reflection = generate_reflection_text(
                 llm_config_path=llm_config_path,

@@ -56,8 +56,9 @@ class WorldQuantBrainClient:
     _auth_error_threshold = _env_int("WQMINER_AUTH_ERROR_THRESHOLD", 4)
     _auth_error_window_sec = _env_float("WQMINER_AUTH_ERROR_WINDOW", 60.0)
     _auth_error_cooldown_sec = _env_float("WQMINER_AUTH_ERROR_COOLDOWN", 12.0)
-    _inflight_limit = _env_int("WQMINER_MAX_INFLIGHT", 4)
+    _inflight_limit = _env_int("WQMINER_MAX_INFLIGHT", 2)
     _inflight_sem = threading.Semaphore(_inflight_limit) if _inflight_limit > 0 else None
+    _force_close = False
     _consecutive_conn_errors = 0
     _last_conn_error_ts = 0.0
     _consecutive_auth_errors = 0
@@ -129,6 +130,7 @@ class WorldQuantBrainClient:
                 floor = min(10.0, max(1.0, extra * 0.5))
                 if floor > cls._global_min_interval_floor:
                     cls._global_min_interval_floor = floor
+                cls._force_close = True
             if cooldown > cls._global_cooldown_until:
                 cls._global_cooldown_until = cooldown
             floor = min(4.0, max(0.5, sleep_sec * 0.5))
@@ -154,6 +156,7 @@ class WorldQuantBrainClient:
             if conn:
                 cls._consecutive_conn_errors = 0
                 cls._last_conn_error_ts = 0.0
+                cls._force_close = False
             if auth:
                 cls._consecutive_auth_errors = 0
                 cls._last_auth_error_ts = 0.0
@@ -302,6 +305,8 @@ class WorldQuantBrainClient:
 
         for attempt in range(1, max_retries + 1):
             self._sync_shared_auth()
+            if self.__class__._force_close and self.sess.headers.get("Connection") != "close":
+                self.sess.headers.update({"Connection": "close"})
             is_meta = any(token in url for token in ("/data-sets", "/data-fields", "/operators"))
             if is_meta:
                 self._throttle(self.metadata_min_interval_sec, self.metadata_jitter_sec, "meta")
