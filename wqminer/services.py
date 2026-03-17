@@ -880,20 +880,18 @@ def run_one_click(
 
     user, pwd = resolve_credentials(credentials_path, username, password, required=True)
 
-    client = WorldQuantBrainClient(
-        username=user,
-        password=pwd,
-        timeout_sec=max(5, int(timeout_sec)),
-        max_retries=max(1, int(max_retries)),
-        disable_proxy=disable_proxy,
-    )
-    client.authenticate()
-
     fields_cache = default_fields_cache_path(region, universe, delay)
     if Path(fields_cache).exists():
         fields = load_data_fields_cache(fields_cache)
         logging.info("Using cached fields: %s (count=%d)", fields_cache, len(fields))
     else:
+        client = WorldQuantBrainClient(
+            username=user,
+            password=pwd,
+            timeout_sec=max(5, int(timeout_sec)),
+            max_retries=max(1, int(max_retries)),
+            disable_proxy=disable_proxy,
+        )
         fields = client.fetch_data_fields(region=region, universe=universe, delay=delay)
         if not fields:
             fields = client.load_fallback_default_fields()

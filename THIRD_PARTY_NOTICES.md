@@ -2,7 +2,7 @@
 
 ## wqb
 
-Portions of the retry-with-`Retry-After` logic in `wqminer/worldquant_client.py` and the filter range helper in `wqminer/filters.py` are adapted from the `wqb` project.
+The `wqb` source code is vendored in `wqminer/wqb` and used by the WorldQuant client. Portions of the retry-with-`Retry-After` logic in `wqminer/worldquant_client.py` and the filter range helper in `wqminer/filters.py` are adapted from the `wqb` project.
 
 MIT License
 

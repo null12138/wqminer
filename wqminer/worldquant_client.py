@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -14,6 +15,7 @@ from requests.auth import HTTPBasicAuth
 
 from .filters import FilterRange
 from .models import DataField, SimulationResult, SimulationSettings
+from .wqb import WQBSession
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,10 @@ logger = logging.getLogger(__name__)
 class WorldQuantBrainClient:
     BASE_URL = "https://api.worldquantbrain.com"
     PLATFORM_ALPHA_URL = "https://platform.worldquantbrain.com/alpha/"
+    _auth_lock = threading.Lock()
+    _shared_headers: Dict[str, str] = {}
+    _shared_cookies: Dict[str, str] = {}
+    _auth_cooldown_until = 0.0
 
     def __init__(
         self,
@@ -41,60 +47,97 @@ class WorldQuantBrainClient:
         if disable_proxy is None:
             disable_proxy = _env_flag("WQMINER_DISABLE_PROXY")
         self.disable_proxy = bool(disable_proxy)
-        self.sess = requests.Session()
+        self.sess = WQBSession((username, password), logger=logger)
         self.sess.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
         self.sess.auth = HTTPBasicAuth(username, password)
+        # Avoid auto-auth on 429; let our retry logic handle rate limits.
+        try:
+            self.sess.expected = lambda resp: resp.status_code not in (204, 401)
+        except Exception:
+            pass
         if self.disable_proxy:
             self.sess.trust_env = False
 
     def _has_auth_token(self) -> bool:
-        return bool(self.sess.headers.get("X-WQB-Session-Token"))
+        if self.sess.headers.get("X-WQB-Session-Token"):
+            return True
+        try:
+            return bool(self.sess.cookies)
+        except Exception:
+            return False
+
+    def _sync_shared_auth(self) -> None:
+        cls = self.__class__
+        if cls._shared_headers:
+            self.sess.headers.update(cls._shared_headers)
+        if cls._shared_cookies:
+            self.sess.cookies.update(cls._shared_cookies)
 
     def _ensure_authenticated(self) -> None:
         if not self.auto_auth:
             return
         if self._has_auth_token():
             return
+        self._sync_shared_auth()
+        if self._has_auth_token():
+            return
         self.authenticate()
 
     def authenticate(self, max_retries: int = 5) -> None:
         max_retries = max(1, int(max_retries))
+        if self._has_auth_token():
+            return
         last_response: Optional[requests.Response] = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = self.sess.post(
-                    f"{self.base_url}/authentication",
-                    auth=HTTPBasicAuth(self.username, self.password),
-                    timeout=self.timeout_sec,
-                )
-            except requests.RequestException as exc:
-                sleep_sec = min(30, 2 ** (attempt - 1))
-                if attempt < max_retries:
-                    logger.warning("Auth request error (%s), retrying in %ss", exc, sleep_sec)
+        cls = self.__class__
+        with cls._auth_lock:
+            self._sync_shared_auth()
+            if self._has_auth_token():
+                return
+            now = time.monotonic()
+            if cls._auth_cooldown_until > now:
+                time.sleep(max(0.0, cls._auth_cooldown_until - now))
+            for attempt in range(1, max_retries + 1):
+                try:
+                    response = self.sess.auth_request(
+                        max_tries=1,
+                        delay_unexpected=2.0,
+                        timeout=self.timeout_sec,
+                    )
+                except requests.RequestException as exc:
+                    sleep_sec = min(30, 2 ** (attempt - 1))
+                    if attempt < max_retries:
+                        logger.warning("Auth request error (%s), retrying in %ss", exc, sleep_sec)
+                        cls._auth_cooldown_until = max(cls._auth_cooldown_until, time.monotonic() + sleep_sec)
+                        time.sleep(sleep_sec)
+                        continue
+                    raise RuntimeError(f"Authentication failed: {exc}") from exc
+
+                last_response = response
+                if response.status_code in (200, 201):
+                    token = response.headers.get("X-WQB-Session-Token")
+                    if token:
+                        self.sess.headers.update({"X-WQB-Session-Token": token})
+                    cls._shared_headers = {"X-WQB-Session-Token": token} if token else {}
+                    try:
+                        cls._shared_cookies = self.sess.cookies.get_dict()
+                    except Exception:
+                        cls._shared_cookies = {}
+                    return
+
+                if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                    sleep_sec = self._retry_sleep_seconds(response, attempt)
+                    logger.warning(
+                        "Auth transient failure %s (attempt %s/%s), retrying in %ss",
+                        response.status_code,
+                        attempt,
+                        max_retries,
+                        sleep_sec,
+                    )
+                    cls._auth_cooldown_until = max(cls._auth_cooldown_until, time.monotonic() + sleep_sec)
                     time.sleep(sleep_sec)
                     continue
-                raise RuntimeError(f"Authentication failed: {exc}") from exc
 
-            last_response = response
-            if response.status_code in (200, 201):
-                token = response.headers.get("X-WQB-Session-Token")
-                if token:
-                    self.sess.headers.update({"X-WQB-Session-Token": token})
-                return
-
-            if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
-                sleep_sec = self._retry_sleep_seconds(response, attempt)
-                logger.warning(
-                    "Auth transient failure %s (attempt %s/%s), retrying in %ss",
-                    response.status_code,
-                    attempt,
-                    max_retries,
-                    sleep_sec,
-                )
-                time.sleep(sleep_sec)
-                continue
-
-            break
+                break
 
         if last_response is None:
             raise RuntimeError("Authentication failed: no response")
@@ -255,6 +298,7 @@ class WorldQuantBrainClient:
         )
         client.sess.headers.update(self.sess.headers)
         client.sess.cookies.update(self.sess.cookies)
+        client._sync_shared_auth()
         return client
 
     def get_datasets(
