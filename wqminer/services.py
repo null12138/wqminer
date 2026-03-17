@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .config import load_credentials, load_llm_config
 from .inspiration import merge_style_prompt
@@ -336,6 +336,9 @@ def _evaluate_expressions(
     max_wait_sec: int,
     concurrency: int,
     concurrency_cap: int = 0,
+    progress_cb: Optional[Callable[[Dict], None]] = None,
+    round_idx: int = 0,
+    stage: str = "simulate",
 ) -> List[Dict[str, float]]:
     results: List[Dict[str, float]] = []
     total = len(expressions)
@@ -402,6 +405,22 @@ def _evaluate_expressions(
         return row
 
     cap = int(concurrency_cap) if concurrency_cap else 0
+    completed = 0
+    success = 0
+    failed = 0
+    if progress_cb:
+        progress_cb(
+            {
+                "stage": stage,
+                "round": round_idx,
+                "total": total,
+                "completed": 0,
+                "success": 0,
+                "failed": 0,
+                "last": {},
+            }
+        )
+
     max_workers = max(1, min(int(concurrency), total))
     if cap > 0:
         max_workers = min(max_workers, cap)
@@ -411,7 +430,31 @@ def _evaluate_expressions(
             for idx, expr in enumerate(expressions, start=1)
         ]
         for fut in as_completed(futures):
-            results.append(fut.result())
+            row = fut.result()
+            results.append(row)
+            completed += 1
+            if row.get("success"):
+                success += 1
+            else:
+                failed += 1
+            if progress_cb:
+                progress_cb(
+                    {
+                        "stage": stage,
+                        "round": round_idx,
+                        "total": total,
+                        "completed": completed,
+                        "success": success,
+                        "failed": failed,
+                        "last": {
+                            "expression": row.get("expression", ""),
+                            "sharpe": row.get("sharpe", 0.0),
+                            "fitness": row.get("fitness", 0.0),
+                            "turnover": row.get("turnover", 0.0),
+                            "alpha_id": row.get("alpha_id", ""),
+                        },
+                    }
+                )
 
     results_sorted = sorted(results, key=lambda x: int(x.get("index", 0)))
     for row in results_sorted:
@@ -586,6 +629,7 @@ def run_one_click(
     reverse_log: str = "",
     negate_max_per_round: int = 0,
     notify_url: str = "",
+    progress_cb: Optional[Callable[[Dict], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> Dict:
     region = region.upper()
@@ -658,6 +702,8 @@ def run_one_click(
     notified_seen: set = set()
 
     try:
+        if progress_cb:
+            progress_cb({"stage": "init", "round": 0, "total": 0, "completed": 0, "success": 0, "failed": 0, "last": {}})
         while True:
             if stop_event is not None and stop_event.is_set():
                 logging.info("Stop requested, exiting before round %s", round_idx + 1)
@@ -665,6 +711,8 @@ def run_one_click(
             round_idx += 1
             per_round = evolve_count if evolve_count and int(evolve_count) > 0 else template_count
             style = base_style if not reflection else merge_style_prompt(base_style, reflection)
+            if progress_cb:
+                progress_cb({"stage": "generate", "round": round_idx, "total": 0, "completed": 0, "success": 0, "failed": 0, "last": {}})
             expressions = _generate_expressions(generator, region, fields, per_round, style)
             results = _evaluate_expressions(
                 username=user,
@@ -677,6 +725,9 @@ def run_one_click(
                 max_wait_sec=max_wait_sec,
                 concurrency=concurrency,
                 concurrency_cap=concurrency_cap,
+                progress_cb=progress_cb,
+                round_idx=round_idx,
+                stage="simulate",
             )
             reverse_candidates = _collect_reverse_candidates(
                 results,
@@ -699,6 +750,9 @@ def run_one_click(
                     max_wait_sec=max_wait_sec,
                     concurrency=concurrency,
                     concurrency_cap=concurrency_cap,
+                    progress_cb=progress_cb,
+                    round_idx=round_idx,
+                    stage="negate",
                 )
                 results.extend(negated_results)
             files.append(_write_results_json(out_root / f"one_click_{ts}_round{round_idx:03}.json", results))

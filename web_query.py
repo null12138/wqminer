@@ -165,6 +165,22 @@ HTML_PAGE = """<!doctype html>
       margin-bottom: 12px;
     }
     .panel-title h3 { margin: 0; font-size: 14px; letter-spacing: .3px; }
+    .progress-grid { display: grid; gap: 10px; }
+    .progress-bar {
+      height: 10px;
+      border-radius: 999px;
+      background: #0b0f14;
+      border: 1px solid var(--border);
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, rgba(90,210,201,0.9), rgba(122,162,255,0.9));
+      transition: width 0.3s ease;
+    }
+    .progress-meta { font-size: 13px; }
+    .progress-sub { font-size: 12px; color: var(--muted); }
     .output { display: grid; gap: 16px; }
     .empty {
       border: 1px dashed var(--border);
@@ -287,6 +303,18 @@ HTML_PAGE = """<!doctype html>
 
     <div class="panel">
       <div class="panel-title">
+        <h3>进度</h3>
+        <span class="muted" id="progress-state">等待启动...</span>
+      </div>
+      <div class="progress-grid">
+        <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+        <div class="progress-meta" id="progress-meta">暂无进度</div>
+        <div class="progress-sub" id="progress-sub">-</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">
         <h3>查询与导出</h3>
         <span class="muted" id="save-state"> </span>
       </div>
@@ -347,6 +375,10 @@ HTML_PAGE = """<!doctype html>
     const exportScope = document.getElementById("export-scope");
     const exportFormat = document.getElementById("export-format");
     const logToggle = document.getElementById("toggle-log");
+    const progressFill = document.getElementById("progress-fill");
+    const progressMeta = document.getElementById("progress-meta");
+    const progressSub = document.getElementById("progress-sub");
+    const progressState = document.getElementById("progress-state");
 
     const COLOR_OPTIONS = [
       { label: "无", value: "" },
@@ -360,6 +392,7 @@ HTML_PAGE = """<!doctype html>
 
     let lastPayload = null;
     let clearTimer = null;
+    let logCollapsed = false;
 
     function formatNumber(value, digits) {
       if (typeof value !== "number" || !isFinite(value)) return "--";
@@ -588,20 +621,48 @@ HTML_PAGE = """<!doctype html>
       });
     }
 
-    async function fetchStatus() {
+    async function fetchProgress() {
       try {
-        const resp = await fetch("/api/status");
+        const resp = await fetch("/api/progress");
         const data = await resp.json();
         const running = data.running;
         statusEl.textContent = running ? "状态: 运行中" : "状态: 已停止";
         statusEl.className = running ? "status-pill status-run" : "status-pill status-stop";
         statusText.textContent = running ? "运行中" : "已停止";
-        metaEl.textContent = data.meta || "";
-        logEl.textContent = data.log || "暂无日志";
+        const results = data.results || {};
+        const count = results.count || "0";
+        const latest = results.latest || "-";
+        metaEl.textContent = `results=${count} | latest=${latest}`;
+
+        const total = Number(data.total || 0);
+        const completed = Number(data.completed || 0);
+        const success = Number(data.success || 0);
+        const failed = Number(data.failed || 0);
+        const round = Number(data.round || 0);
+        const stage = data.stage || "-";
+        const pct = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+        progressFill.style.width = `${pct}%`;
+        progressState.textContent = running ? `运行中 · ${stage}` : "已停止";
+        progressMeta.textContent = total > 0 ? `完成 ${completed}/${total} (${pct}%)` : "等待任务...";
+        const last = data.last || {};
+        const lastExpr = (last.expression || "").toString().trim();
+        const lastInfo = lastExpr ? `最近: ${lastExpr.slice(0, 80)}` : "暂无最近因子";
+        progressSub.textContent = `成功 ${success} · 失败 ${failed} · Round ${round} · ${lastInfo}`;
       } catch (err) {
         statusEl.textContent = "状态: unknown";
         statusText.textContent = "unknown";
         metaEl.textContent = "状态获取失败: " + err;
+      }
+    }
+
+    async function fetchLog() {
+      if (logCollapsed) return;
+      try {
+        const resp = await fetch("/api/status");
+        const data = await resp.json();
+        logEl.textContent = data.log || "暂无日志";
+      } catch (err) {
+        logEl.textContent = "日志获取失败: " + err;
       }
     }
 
@@ -629,20 +690,28 @@ HTML_PAGE = """<!doctype html>
 
     startBtn.addEventListener("click", async () => {
       await fetch("/api/start", { method: "POST" });
-      fetchStatus();
+      fetchProgress();
+      fetchLog();
     });
     stopBtn.addEventListener("click", async () => {
       await fetch("/api/stop", { method: "POST" });
-      fetchStatus();
+      fetchProgress();
+      fetchLog();
     });
     runBtn.addEventListener("click", runQuery);
     exportBtn.addEventListener("click", exportData);
     logToggle.addEventListener("click", () => {
       logEl.classList.toggle("collapsed");
+      logCollapsed = logEl.classList.contains("collapsed");
+      if (!logCollapsed) {
+        fetchLog();
+      }
     });
 
-    fetchStatus();
-    setInterval(fetchStatus, 3000);
+    fetchProgress();
+    fetchLog();
+    setInterval(fetchProgress, 2000);
+    setInterval(fetchLog, 6000);
   </script>
 </body>
 </html>
@@ -978,9 +1047,29 @@ class FlowController:
         self.results_dir = results_dir_override or "results/one_click"
         self.library_path = library_override or "templates/library.json"
         self.tag_store = TagStore(Path(self.results_dir) / "tags.json")
+        self.progress_lock = threading.Lock()
+        self.progress = {
+            "stage": "idle",
+            "round": 0,
+            "total": 0,
+            "completed": 0,
+            "success": 0,
+            "failed": 0,
+            "last": {},
+            "updated": self._now(),
+        }
 
     def _now(self) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def update_progress(self, **fields) -> None:
+        with self.progress_lock:
+            self.progress.update(fields)
+            self.progress["updated"] = self._now()
+
+    def get_progress(self) -> Dict:
+        with self.progress_lock:
+            return dict(self.progress)
 
     def start(self) -> str:
         with self.lock:
@@ -990,6 +1079,15 @@ class FlowController:
             self.running = True
             self.last_error = ""
             self.last_start = self._now()
+            self.update_progress(
+                stage="starting",
+                round=0,
+                total=0,
+                completed=0,
+                success=0,
+                failed=0,
+                last={},
+            )
             self.thread = threading.Thread(target=self._run, daemon=True)
             self.thread.start()
             return "started"
@@ -1009,6 +1107,12 @@ class FlowController:
             self.results_dir = output_dir
             self.library_path = library_output
             self.tag_store.set_path(Path(self.results_dir) / "tags.json")
+            self.update_progress(stage="setup")
+
+            def progress_cb(payload: Dict) -> None:
+                if not payload:
+                    return
+                self.update_progress(**payload)
 
             summary = services.run_one_click(
                 region=_get(cfg, "region", "USA"),
@@ -1042,6 +1146,7 @@ class FlowController:
                 reverse_log=_get(cfg, "reverse_log", ""),
                 negate_max_per_round=int(_get(cfg, "negate_max_per_round", 0)),
                 notify_url=_get(cfg, "notify_url", ""),
+                progress_cb=progress_cb,
                 stop_event=self.stop_event,
             )
             self.last_summary = summary
@@ -1052,6 +1157,7 @@ class FlowController:
             with self.lock:
                 self.running = False
                 self.last_stop = self._now()
+            self.update_progress(stage="idle")
 
 
 APP_STATE: Optional[FlowController] = None
@@ -1111,6 +1217,25 @@ class Handler(BaseHTTPRequestHandler):
                     "log": LOG_BUFFER.get_text() if LOG_BUFFER else "",
                 }
             )
+            return
+
+        if parsed.path == "/api/progress":
+            state = APP_STATE
+            if not state:
+                self._send_json({"error": "state not ready"}, status=500)
+                return
+            stats = _results_stats(state.results_dir)
+            progress = state.get_progress()
+            progress.update(
+                {
+                    "running": state.running,
+                    "results": stats,
+                    "last_error": state.last_error or "",
+                    "last_start": state.last_start or "",
+                    "last_stop": state.last_stop or "",
+                }
+            )
+            self._send_json(progress)
             return
 
         if parsed.path.startswith("/api/"):
@@ -1190,7 +1315,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, fmt: str, *args) -> None:
-        logging.info("%s - %s", self.address_string(), fmt % args)
+        msg = fmt % args
+        if "/api/status" in msg or "/api/progress" in msg:
+            return
+        logging.info("%s - %s", self.address_string(), msg)
 
 
 def main() -> int:
