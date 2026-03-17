@@ -244,15 +244,26 @@ def _collect_reverse_candidates(
 def _summarize_results(rows: Sequence[Dict[str, float]]) -> Dict[str, float]:
     total = len(rows)
     if total == 0:
-        return {"total": 0, "avg_sharpe": 0.0, "avg_fitness": 0.0, "avg_turnover": 0.0}
+        return {
+            "total": 0,
+            "avg_sharpe": 0.0,
+            "avg_fitness": 0.0,
+            "avg_turnover": 0.0,
+            "success": 0,
+            "inactive": 0,
+        }
     avg_sharpe = sum(float(r.get("sharpe", 0.0)) for r in rows) / total
     avg_fitness = sum(float(r.get("fitness", 0.0)) for r in rows) / total
     avg_turnover = sum(float(r.get("turnover", 0.0)) for r in rows) / total
+    success = sum(1 for r in rows if r.get("success"))
+    inactive = sum(1 for r in rows if float(r.get("turnover", 0.0)) <= 0.0)
     return {
         "total": total,
         "avg_sharpe": avg_sharpe,
         "avg_fitness": avg_fitness,
         "avg_turnover": avg_turnover,
+        "success": success,
+        "inactive": inactive,
     }
 
 
@@ -282,8 +293,8 @@ def generate_reflection_text(
 
     system_prompt = (
         "You are a quantitative alpha researcher. "
-        "Provide a brief reflection and specific next-step guidance. "
-        "No chain-of-thought. 1-2 sentences only."
+        "Be blunt and aggressively prioritize hit-rate and throughput. "
+        "No chain-of-thought, no lists, no code. 1-2 sentences only."
     )
     user_prompt = (
         f"Round: {round_index}\n"
@@ -291,12 +302,18 @@ def generate_reflection_text(
         f"Universe: {universe}\n"
         f"Delay: {delay}\n"
         f"Total: {summary['total']}\n"
+        f"Success: {summary['success']}\n"
+        f"Inactive (turnover<=0): {summary['inactive']}\n"
         f"Avg sharpe: {summary['avg_sharpe']:.3f}\n"
         f"Avg fitness: {summary['avg_fitness']:.3f}\n"
         f"Avg turnover: {summary['avg_turnover']:.2f}\n"
         "Top expressions:\n"
         + ("\n".join(lines) if lines else "none")
-        + "\n\nReturn 1-2 sentences: diagnose performance and suggest concrete operator/field directions."
+        + "\n\nReturn 1-2 sentences: diagnose performance and give 2 concrete next-step ideas plus 1 explicit "
+        "avoid/stop direction. "
+        "Each idea must name at least one operator (e.g., ts_rank, decay_linear, ts_delta, zscore, winsorize, "
+        "group_neutralize) and one field family (news, price/volume, fundamentals, analyst, alternative). "
+        "If inactive is high, explicitly say to avoid zero-activity signals."
     )
 
     try:

@@ -14,6 +14,10 @@ class LLMConfig:
     base_url: str = "https://api.openai.com/v1"
     temperature: float = 0.4
     max_tokens: int = 1200
+    max_output_tokens: int = 0
+    reasoning_effort: str = ""
+    verbosity: str = ""
+    use_responses: bool = False
 
 
 def load_json_file(path: str) -> Dict:
@@ -43,6 +47,10 @@ def load_llm_config(path: str = "") -> LLMConfig:
     base_url = payload.get("base_url") or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
     temperature = float(payload.get("temperature", os.getenv("LLM_TEMPERATURE", "0.4")))
     max_tokens = int(payload.get("max_tokens", os.getenv("LLM_MAX_TOKENS", "1200")))
+    max_output_tokens = int(payload.get("max_output_tokens", os.getenv("LLM_MAX_OUTPUT_TOKENS", "0")))
+    reasoning_effort = str(payload.get("reasoning_effort", os.getenv("LLM_REASONING_EFFORT", ""))).strip()
+    verbosity = str(payload.get("verbosity", os.getenv("LLM_VERBOSITY", ""))).strip()
+    use_responses = _to_bool(payload.get("use_responses", os.getenv("LLM_USE_RESPONSES", "")))
 
     if not api_key:
         raise ValueError("Missing LLM API key. Set in llm config or LLM_API_KEY env.")
@@ -53,6 +61,10 @@ def load_llm_config(path: str = "") -> LLMConfig:
         base_url=normalize_llm_base_url(base_url),
         temperature=temperature,
         max_tokens=max_tokens,
+        max_output_tokens=max_output_tokens,
+        reasoning_effort=reasoning_effort,
+        verbosity=verbosity,
+        use_responses=use_responses,
     )
 
 
@@ -80,6 +92,16 @@ def normalize_llm_base_url(base_url: str) -> str:
 
     normalized = urlunparse((scheme, netloc, path, "", "", ""))
     return normalized.rstrip("/")
+
+
+def _to_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def load_run_config(path: str) -> Dict:
