@@ -387,24 +387,45 @@ def _retry_failed_expressions(
     retry_rounds: int,
     retry_sleep_sec: int,
     stage: str,
+    stop_event: Optional[threading.Event] = None,
     **kwargs,
 ) -> List[Dict[str, float]]:
     results = evaluator(expressions=expressions, stage=stage, **kwargs)
     by_expr = {str(row.get("expression", "")): row for row in results}
     pending = [expr for expr in expressions if not by_expr.get(expr, {}).get("success")]
 
-    for attempt in range(1, max(0, int(retry_rounds)) + 1):
-        if not pending:
-            break
-        if retry_sleep_sec and int(retry_sleep_sec) > 0:
-            time.sleep(int(retry_sleep_sec))
-        logging.info("Retrying %s expressions (%s/%s)", len(pending), attempt, retry_rounds)
-        retry_stage = f"{stage}_retry{attempt}"
-        retry_results = evaluator(expressions=pending, stage=retry_stage, **kwargs)
-        for row in retry_results:
-            expr = str(row.get("expression", ""))
-            by_expr[expr] = row
-        pending = [expr for expr in pending if not by_expr.get(expr, {}).get("success")]
+    if int(retry_rounds) < 0:
+        attempt = 0
+        while pending:
+            if stop_event is not None and stop_event.is_set():
+                logging.info("Stop requested, exiting retries with %s pending", len(pending))
+                break
+            attempt += 1
+            if retry_sleep_sec and int(retry_sleep_sec) > 0:
+                time.sleep(int(retry_sleep_sec))
+            logging.info("Retrying %s expressions (attempt %s/unbounded)", len(pending), attempt)
+            retry_stage = f"{stage}_retry{attempt}"
+            retry_results = evaluator(expressions=pending, stage=retry_stage, **kwargs)
+            for row in retry_results:
+                expr = str(row.get("expression", ""))
+                by_expr[expr] = row
+            pending = [expr for expr in pending if not by_expr.get(expr, {}).get("success")]
+    else:
+        for attempt in range(1, max(0, int(retry_rounds)) + 1):
+            if not pending:
+                break
+            if stop_event is not None and stop_event.is_set():
+                logging.info("Stop requested, exiting retries with %s pending", len(pending))
+                break
+            if retry_sleep_sec and int(retry_sleep_sec) > 0:
+                time.sleep(int(retry_sleep_sec))
+            logging.info("Retrying %s expressions (%s/%s)", len(pending), attempt, retry_rounds)
+            retry_stage = f"{stage}_retry{attempt}"
+            retry_results = evaluator(expressions=pending, stage=retry_stage, **kwargs)
+            for row in retry_results:
+                expr = str(row.get("expression", ""))
+                by_expr[expr] = row
+            pending = [expr for expr in pending if not by_expr.get(expr, {}).get("success")]
 
     if pending:
         logging.warning("Still failed after %s retries: %s", retry_rounds, len(pending))
@@ -843,6 +864,7 @@ def run_one_click(
                     retry_rounds=retry_failed_rounds,
                     retry_sleep_sec=retry_failed_sleep,
                     stage="simulate",
+                    stop_event=stop_event,
                     username=user,
                     password=pwd,
                     timeout_sec=timeout_sec,
@@ -892,6 +914,7 @@ def run_one_click(
                         retry_rounds=retry_failed_rounds,
                         retry_sleep_sec=retry_failed_sleep,
                         stage="negate",
+                        stop_event=stop_event,
                         username=user,
                         password=pwd,
                         timeout_sec=timeout_sec,

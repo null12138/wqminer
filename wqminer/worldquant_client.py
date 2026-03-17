@@ -1,6 +1,9 @@
 """WorldQuant Brain API client."""
 
+from __future__ import annotations
+
 import asyncio
+import itertools
 import json
 import logging
 import os
@@ -55,6 +58,8 @@ class WorldQuantBrainClient:
             self.sess.expected = lambda resp: resp.status_code not in (204, 401)
         except Exception:
             pass
+        if os.getenv("WQMINER_DISABLE_KEEPALIVE", "").strip().lower() in {"1", "true", "yes"}:
+            self.sess.headers.update({"Connection": "close"})
         if self.disable_proxy:
             self.sess.trust_env = False
 
@@ -1060,13 +1065,30 @@ class WorldQuantBrainClient:
         max_wait_sec: int = 600,
     ) -> SimulationResult:
         payload = settings.to_api_payload(expression)
-        max_tries = _max_tries_from_wait(max_wait_sec, poll_interval_sec)
-        resp = await self.sess.simulate(
-            payload,
-            max_tries=range(max_tries),
-            delay_key_error=float(max(1, int(poll_interval_sec))),
-            delay_value_error=float(max(1, int(poll_interval_sec))),
-        )
+        try:
+            resp = await asyncio.wait_for(
+                self.sess.simulate(
+                    payload,
+                    max_tries=itertools.repeat(None),
+                    delay_key_error=float(max(1, int(poll_interval_sec))),
+                    delay_value_error=float(max(1, int(poll_interval_sec))),
+                ),
+                timeout=max(1, int(max_wait_sec)),
+            )
+        except asyncio.TimeoutError:
+            return SimulationResult(
+                expression=expression,
+                alpha_id="",
+                success=False,
+                error_message="simulation_timeout",
+            )
+        except Exception as exc:
+            return SimulationResult(
+                expression=expression,
+                alpha_id="",
+                success=False,
+                error_message=f"simulation_error: {exc}",
+            )
         if resp is None or resp.status_code not in (200, 201):
             return SimulationResult(
                 expression=expression,
@@ -1228,10 +1250,6 @@ def _to_float(value) -> float:
         return 0.0
 
 
-def _max_tries_from_wait(max_wait_sec: int, poll_interval_sec: int) -> int:
-    poll = max(1, int(poll_interval_sec))
-    wait = max(poll, int(max_wait_sec))
-    return max(1, wait // poll)
 
 
 def _env_flag(name: str) -> bool:

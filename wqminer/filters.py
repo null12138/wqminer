@@ -3,6 +3,8 @@
 Adapted from wqb (MIT License, Copyright (c) 2025 Rocky Haotian Du).
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from math import inf, isinf
