@@ -61,6 +61,9 @@ def main() -> int:
         reverse_fitness_max=float(_get(cfg, "reverse_fitness_max", -1.0)),
         reverse_log=_get(cfg, "reverse_log", ""),
         negate_max_per_round=int(_get(cfg, "negate_max_per_round", 0)),
+        retry_failed_rounds=int(_get(cfg, "retry_failed_rounds", 2)),
+        retry_failed_sleep=int(_get(cfg, "retry_failed_sleep", 2)),
+        disable_proxy=bool(_get(cfg, "disable_proxy", False)),
         notify_url=_get(cfg, "notify_url", ""),
     )
 

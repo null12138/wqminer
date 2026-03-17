@@ -338,6 +338,7 @@ def _evaluate_expressions(
     max_wait_sec: int,
     concurrency: int,
     concurrency_cap: int = 0,
+    disable_proxy: Optional[bool] = None,
     progress_cb: Optional[Callable[[Dict], None]] = None,
     round_idx: int = 0,
     stage: str = "simulate",
@@ -348,20 +349,20 @@ def _evaluate_expressions(
     if total == 0:
         return results
 
-    auth_lock = threading.Lock()
+    seed = WorldQuantBrainClient(
+        username=username,
+        password=password,
+        timeout_sec=max(5, int(timeout_sec)),
+        max_retries=max(1, int(max_retries)),
+        disable_proxy=disable_proxy,
+    )
+    seed.authenticate()
     local = threading.local()
 
     def get_client() -> WorldQuantBrainClient:
         client = getattr(local, "client", None)
         if client is None:
-            client = WorldQuantBrainClient(
-                username=username,
-                password=password,
-                timeout_sec=max(5, int(timeout_sec)),
-                max_retries=max(1, int(max_retries)),
-            )
-            with auth_lock:
-                client.authenticate()
+            client = seed._clone_client()
             local.client = client
         return client
 
@@ -476,6 +477,38 @@ def _evaluate_expressions(
     return results_sorted
 
 
+def _retry_failed_expressions(
+    evaluator: Callable[..., List[Dict[str, float]]],
+    *,
+    expressions: Sequence[str],
+    retry_rounds: int,
+    retry_sleep_sec: int,
+    stage: str,
+    **kwargs,
+) -> List[Dict[str, float]]:
+    results = evaluator(expressions=expressions, stage=stage, **kwargs)
+    by_expr = {str(row.get("expression", "")): row for row in results}
+    pending = [expr for expr in expressions if not by_expr.get(expr, {}).get("success")]
+
+    for attempt in range(1, max(0, int(retry_rounds)) + 1):
+        if not pending:
+            break
+        if retry_sleep_sec and int(retry_sleep_sec) > 0:
+            time.sleep(int(retry_sleep_sec))
+        logging.info("Retrying %s expressions (%s/%s)", len(pending), attempt, retry_rounds)
+        retry_stage = f"{stage}_retry{attempt}"
+        retry_results = evaluator(expressions=pending, stage=retry_stage, **kwargs)
+        for row in retry_results:
+            expr = str(row.get("expression", ""))
+            by_expr[expr] = row
+        pending = [expr for expr in pending if not by_expr.get(expr, {}).get("success")]
+
+    if pending:
+        logging.warning("Still failed after %s retries: %s", retry_rounds, len(pending))
+
+    return [by_expr[expr] for expr in expressions if expr in by_expr]
+
+
 def _evaluate_expressions_async(
     username: str,
     password: str,
@@ -487,6 +520,7 @@ def _evaluate_expressions_async(
     max_wait_sec: int,
     concurrency: int,
     concurrency_cap: int = 0,
+    disable_proxy: Optional[bool] = None,
     progress_cb: Optional[Callable[[Dict], None]] = None,
     round_idx: int = 0,
     stage: str = "simulate",
@@ -502,8 +536,17 @@ def _evaluate_expressions_async(
         password=password,
         timeout_sec=max(5, int(timeout_sec)),
         max_retries=max(1, int(max_retries)),
+        disable_proxy=disable_proxy,
     )
     seed.authenticate()
+    local = threading.local()
+
+    def get_client() -> WorldQuantBrainClient:
+        client = getattr(local, "client", None)
+        if client is None:
+            client = seed._clone_client()
+            local.client = client
+        return client
 
     completed = 0
     success = 0
@@ -528,13 +571,7 @@ def _evaluate_expressions_async(
 
     def run_one(idx: int, expr: str) -> Dict[str, float]:
         try:
-            client = WorldQuantBrainClient(
-                username=username,
-                password=password,
-                timeout_sec=max(5, int(timeout_sec)),
-                max_retries=max(1, int(max_retries)),
-            )
-            result = client.simulate_expression(
+            result = get_client().simulate_expression(
                 expression=expr,
                 settings=settings,
                 poll_interval_sec=max(1, int(poll_interval_sec)),
@@ -813,6 +850,9 @@ def run_one_click(
     reverse_fitness_max: float = -1.0,
     reverse_log: str = "",
     negate_max_per_round: int = 0,
+    retry_failed_rounds: int = 2,
+    retry_failed_sleep: int = 2,
+    disable_proxy: Optional[bool] = None,
     notify_url: str = "",
     progress_cb: Optional[Callable[[Dict], None]] = None,
     stop_event: Optional[threading.Event] = None,
@@ -828,6 +868,7 @@ def run_one_click(
         password=pwd,
         timeout_sec=max(5, int(timeout_sec)),
         max_retries=max(1, int(max_retries)),
+        disable_proxy=disable_proxy,
     )
     client.authenticate()
 
@@ -902,22 +943,45 @@ def run_one_click(
             expressions = _generate_expressions(generator, region, fields, per_round, style)
             def row_cb(row: Dict[str, float]) -> None:
                 _maybe_notify_row(row, region, universe, delay, round_idx, notify_url, notified_seen)
-            results = evaluator(
-                username=user,
-                password=pwd,
-                timeout_sec=timeout_sec,
-                max_retries=max_retries,
-                expressions=expressions,
-                settings=settings,
-                poll_interval_sec=poll_interval_sec,
-                max_wait_sec=max_wait_sec,
-                concurrency=concurrency,
-                concurrency_cap=concurrency_cap,
-                progress_cb=progress_cb,
-                round_idx=round_idx,
-                stage="simulate",
-                row_cb=row_cb,
-            )
+            if retry_failed_rounds and int(retry_failed_rounds) > 0:
+                results = _retry_failed_expressions(
+                    evaluator,
+                    expressions=expressions,
+                    retry_rounds=retry_failed_rounds,
+                    retry_sleep_sec=retry_failed_sleep,
+                    stage="simulate",
+                    username=user,
+                    password=pwd,
+                    timeout_sec=timeout_sec,
+                    max_retries=max_retries,
+                    settings=settings,
+                    poll_interval_sec=poll_interval_sec,
+                    max_wait_sec=max_wait_sec,
+                    concurrency=concurrency,
+                    concurrency_cap=concurrency_cap,
+                    disable_proxy=disable_proxy,
+                    progress_cb=progress_cb,
+                    round_idx=round_idx,
+                    row_cb=row_cb,
+                )
+            else:
+                results = evaluator(
+                    username=user,
+                    password=pwd,
+                    timeout_sec=timeout_sec,
+                    max_retries=max_retries,
+                    expressions=expressions,
+                    settings=settings,
+                    poll_interval_sec=poll_interval_sec,
+                    max_wait_sec=max_wait_sec,
+                    concurrency=concurrency,
+                    concurrency_cap=concurrency_cap,
+                    disable_proxy=disable_proxy,
+                    progress_cb=progress_cb,
+                    round_idx=round_idx,
+                    stage="simulate",
+                    row_cb=row_cb,
+                )
             reverse_candidates = _collect_reverse_candidates(
                 results,
                 sharpe_max=reverse_sharpe_max,
@@ -928,22 +992,45 @@ def run_one_click(
             )
             if reverse_candidates:
                 logging.info("Reverse factors detected: %d, evaluating negated expressions", len(reverse_candidates))
-                negated_results = evaluator(
-                    username=user,
-                    password=pwd,
-                    timeout_sec=timeout_sec,
-                    max_retries=max_retries,
-                    expressions=reverse_candidates,
-                    settings=settings,
-                    poll_interval_sec=poll_interval_sec,
-                    max_wait_sec=max_wait_sec,
-                    concurrency=concurrency,
-                    concurrency_cap=concurrency_cap,
-                    progress_cb=progress_cb,
-                    round_idx=round_idx,
-                    stage="negate",
-                    row_cb=row_cb,
-                )
+                if retry_failed_rounds and int(retry_failed_rounds) > 0:
+                    negated_results = _retry_failed_expressions(
+                        evaluator,
+                        expressions=reverse_candidates,
+                        retry_rounds=retry_failed_rounds,
+                        retry_sleep_sec=retry_failed_sleep,
+                        stage="negate",
+                        username=user,
+                        password=pwd,
+                        timeout_sec=timeout_sec,
+                        max_retries=max_retries,
+                        settings=settings,
+                        poll_interval_sec=poll_interval_sec,
+                        max_wait_sec=max_wait_sec,
+                        concurrency=concurrency,
+                        concurrency_cap=concurrency_cap,
+                        disable_proxy=disable_proxy,
+                        progress_cb=progress_cb,
+                        round_idx=round_idx,
+                        row_cb=row_cb,
+                    )
+                else:
+                    negated_results = evaluator(
+                        username=user,
+                        password=pwd,
+                        timeout_sec=timeout_sec,
+                        max_retries=max_retries,
+                        expressions=reverse_candidates,
+                        settings=settings,
+                        poll_interval_sec=poll_interval_sec,
+                        max_wait_sec=max_wait_sec,
+                        concurrency=concurrency,
+                        concurrency_cap=concurrency_cap,
+                        disable_proxy=disable_proxy,
+                        progress_cb=progress_cb,
+                        round_idx=round_idx,
+                        stage="negate",
+                        row_cb=row_cb,
+                    )
                 results.extend(negated_results)
             files.append(_write_results_json(out_root / f"one_click_{ts}_round{round_idx:03}.json", results))
             added = _append_library(library_output, results, library_sharpe_min, library_fitness_min)

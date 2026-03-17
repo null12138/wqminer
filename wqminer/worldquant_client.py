@@ -4,8 +4,6 @@ import asyncio
 import json
 import logging
 import os
-import random
-import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -20,54 +18,9 @@ from .models import DataField, SimulationResult, SimulationSettings
 logger = logging.getLogger(__name__)
 
 
-def _env_float(name: str, default: float = 0.0) -> float:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return max(0.0, float(raw))
-    except Exception:
-        return default
-
-
-def _env_int(name: str, default: int = 0) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except Exception:
-        return default
-
-
 class WorldQuantBrainClient:
     BASE_URL = "https://api.worldquantbrain.com"
     PLATFORM_ALPHA_URL = "https://platform.worldquantbrain.com/alpha/"
-    _global_lock = threading.Lock()
-    _auth_lock = threading.RLock()
-    _global_last_request_ts = 0.0
-    _global_last_meta_ts = 0.0
-    _global_cooldown_until = 0.0
-    _global_min_interval_floor = 0.0
-    _global_last_rate_limit_ts = 0.0
-    _global_rate_limit_hits = 0
-    _global_rate_limit_window_start = 0.0
-    _conn_error_threshold = _env_int("WQMINER_CONN_ERROR_THRESHOLD", 6)
-    _conn_error_window_sec = _env_float("WQMINER_CONN_ERROR_WINDOW", 60.0)
-    _conn_error_cooldown_sec = _env_float("WQMINER_CONN_ERROR_COOLDOWN", 30.0)
-    _auth_error_threshold = _env_int("WQMINER_AUTH_ERROR_THRESHOLD", 4)
-    _auth_error_window_sec = _env_float("WQMINER_AUTH_ERROR_WINDOW", 60.0)
-    _auth_error_cooldown_sec = _env_float("WQMINER_AUTH_ERROR_COOLDOWN", 12.0)
-    _inflight_limit = _env_int("WQMINER_MAX_INFLIGHT", 2)
-    _inflight_sem = threading.Semaphore(_inflight_limit) if _inflight_limit > 0 else None
-    _force_close = False
-    _consecutive_conn_errors = 0
-    _last_conn_error_ts = 0.0
-    _consecutive_auth_errors = 0
-    _last_auth_error_ts = 0.0
-    _shared_auth_ts = 0.0
-    _shared_headers: Dict[str, str] = {}
-    _shared_cookies: Dict[str, str] = {}
 
     def __init__(
         self,
@@ -77,194 +30,37 @@ class WorldQuantBrainClient:
         base_url: Optional[str] = None,
         max_retries: int = 5,
         auto_auth: bool = True,
-    ):
+        disable_proxy: Optional[bool] = None,
+    ) -> None:
         self.username = username
         self.password = password
-        self.timeout_sec = timeout_sec
+        self.timeout_sec = max(1, int(timeout_sec))
         self.base_url = (base_url or self.BASE_URL).rstrip("/")
         self.max_retries = max(1, int(max_retries))
         self.auto_auth = bool(auto_auth)
+        if disable_proxy is None:
+            disable_proxy = _env_flag("WQMINER_DISABLE_PROXY")
+        self.disable_proxy = bool(disable_proxy)
         self.sess = requests.Session()
         self.sess.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
         self.sess.auth = HTTPBasicAuth(username, password)
-        if os.getenv("WQMINER_DISABLE_KEEPALIVE", "").strip().lower() in {"1", "true", "yes"}:
-            self.sess.headers.update({"Connection": "close"})
-        self.min_request_interval_sec = _env_float("WQMINER_MIN_REQUEST_INTERVAL", 0.0)
-        self.request_jitter_sec = _env_float("WQMINER_REQUEST_JITTER", 0.0)
-        self.metadata_min_interval_sec = _env_float("WQMINER_METADATA_MIN_INTERVAL", 0.0)
-        self.metadata_jitter_sec = _env_float("WQMINER_METADATA_JITTER", 0.0)
-        self.auth_min_interval_sec = _env_float("WQMINER_AUTH_MIN_INTERVAL", 6.0)
-        self._auth_snapshot_ts = 0.0
-        self._last_auth_attempt_ts = 0.0
-        self._auth_inflight_lock = threading.Lock()
-
-    def _sync_shared_auth(self) -> None:
-        cls = self.__class__
-        if cls._shared_auth_ts <= self._auth_snapshot_ts:
-            return
-        with cls._auth_lock:
-            if cls._shared_auth_ts <= self._auth_snapshot_ts:
-                return
-            if cls._shared_headers:
-                self.sess.headers.update(cls._shared_headers)
-            if cls._shared_cookies:
-                self.sess.cookies.update(cls._shared_cookies)
-            self._auth_snapshot_ts = cls._shared_auth_ts
-
-    def _recent_shared_auth(self) -> bool:
-        cls = self.__class__
-        if cls._shared_auth_ts <= 0:
-            return False
-        return (time.monotonic() - cls._shared_auth_ts) < self.auth_min_interval_sec
+        if self.disable_proxy:
+            self.sess.trust_env = False
 
     def _has_auth_token(self) -> bool:
-        if self.sess.headers.get("X-WQB-Session-Token"):
-            return True
-        shared = self.__class__._shared_headers.get("X-WQB-Session-Token")
-        return bool(shared)
+        return bool(self.sess.headers.get("X-WQB-Session-Token"))
 
     def _ensure_authenticated(self) -> None:
         if not self.auto_auth:
             return
-        if self._recent_shared_auth():
-            self._sync_shared_auth()
-            return
         if self._has_auth_token():
             return
-        with self._auth_inflight_lock:
-            if self._recent_shared_auth():
-                self._sync_shared_auth()
-                return
-            if self._has_auth_token():
-                return
-            self.authenticate()
-
-    @classmethod
-    def _note_connect_failure(cls, sleep_sec: float) -> None:
-        if sleep_sec <= 0:
-            return
-        now = time.monotonic()
-        with cls._global_lock:
-            if cls._last_conn_error_ts == 0.0 or now - cls._last_conn_error_ts > cls._conn_error_window_sec:
-                cls._consecutive_conn_errors = 0
-            cls._consecutive_conn_errors += 1
-            cls._last_conn_error_ts = now
-
-            cooldown = now + min(8.0, sleep_sec)
-            if cls._consecutive_conn_errors >= cls._conn_error_threshold:
-                extra = min(cls._conn_error_cooldown_sec, cls._consecutive_conn_errors * 2.0)
-                cooldown = max(cooldown, now + extra)
-                floor = min(10.0, max(1.0, extra * 0.5))
-                if floor > cls._global_min_interval_floor:
-                    cls._global_min_interval_floor = floor
-                cls._force_close = True
-            if cooldown > cls._global_cooldown_until:
-                cls._global_cooldown_until = cooldown
-            floor = min(4.0, max(0.5, sleep_sec * 0.5))
-            if floor > cls._global_min_interval_floor:
-                cls._global_min_interval_floor = floor
-
-    @classmethod
-    def _note_auth_error(cls) -> None:
-        now = time.monotonic()
-        with cls._global_lock:
-            if cls._last_auth_error_ts == 0.0 or now - cls._last_auth_error_ts > cls._auth_error_window_sec:
-                cls._consecutive_auth_errors = 0
-            cls._consecutive_auth_errors += 1
-            cls._last_auth_error_ts = now
-            if cls._consecutive_auth_errors >= cls._auth_error_threshold:
-                cooldown = now + cls._auth_error_cooldown_sec
-                if cooldown > cls._global_cooldown_until:
-                    cls._global_cooldown_until = cooldown
-
-    @classmethod
-    def _reset_error_counters(cls, conn: bool = True, auth: bool = True) -> None:
-        with cls._global_lock:
-            if conn:
-                cls._consecutive_conn_errors = 0
-                cls._last_conn_error_ts = 0.0
-                cls._force_close = False
-            if auth:
-                cls._consecutive_auth_errors = 0
-                cls._last_auth_error_ts = 0.0
-
-    @classmethod
-    def _throttle(cls, min_interval_sec: float, jitter_sec: float, bucket: str) -> None:
-        with cls._global_lock:
-            now = time.monotonic()
-            if cls._global_last_rate_limit_ts and cls._global_min_interval_floor > 0:
-                if now - cls._global_last_rate_limit_ts > 120:
-                    cls._global_min_interval_floor = max(0.0, cls._global_min_interval_floor * 0.5)
-                    cls._global_last_rate_limit_ts = now
-            last = cls._global_last_request_ts if bucket == "global" else cls._global_last_meta_ts
-            interval = max(min_interval_sec, cls._global_min_interval_floor)
-            wait = interval - (now - last) if interval > 0 else 0.0
-            if cls._global_cooldown_until > now:
-                wait = max(wait, cls._global_cooldown_until - now)
-            if jitter_sec > 0:
-                wait += random.uniform(0.0, jitter_sec)
-            elif interval > 0 and cls._global_min_interval_floor > 0:
-                wait += random.uniform(0.0, min(0.2, interval * 0.2))
-            if wait > 0:
-                time.sleep(wait)
-                now = time.monotonic()
-            if bucket == "global":
-                cls._global_last_request_ts = now
-            else:
-                cls._global_last_meta_ts = now
-
-    @classmethod
-    def _note_rate_limit(cls, sleep_sec: float) -> None:
-        if sleep_sec <= 0:
-            return
-        now = time.monotonic()
-        with cls._global_lock:
-            if cls._global_rate_limit_window_start == 0.0 or now - cls._global_rate_limit_window_start > 60:
-                cls._global_rate_limit_window_start = now
-                cls._global_rate_limit_hits = 0
-            cls._global_rate_limit_hits += 1
-
-            until = now + sleep_sec
-            if until > cls._global_cooldown_until:
-                cls._global_cooldown_until = until
-
-            base = max(1.0, float(sleep_sec))
-            mult = 1.0 + min(6.0, cls._global_rate_limit_hits * 0.5)
-            max_floor = max(6.0, base)
-            floor = min(max_floor, base * mult)
-            if floor < base:
-                floor = base
-            if floor > cls._global_min_interval_floor:
-                cls._global_min_interval_floor = floor
-            cls._global_last_rate_limit_ts = now
+        self.authenticate()
 
     def authenticate(self, max_retries: int = 5) -> None:
-        if max_retries is None:
-            max_retries = self.max_retries
-        cls = self.__class__
-        with cls._auth_lock:
-            if cls._shared_auth_ts and cls._shared_auth_ts > self._auth_snapshot_ts:
-                self._sync_shared_auth()
-                if self._recent_shared_auth():
-                    return
-
-        last_response = None
+        max_retries = max(1, int(max_retries))
+        last_response: Optional[requests.Response] = None
         for attempt in range(1, max_retries + 1):
-            with cls._auth_lock:
-                if cls._shared_auth_ts and cls._shared_auth_ts > self._auth_snapshot_ts:
-                    self._sync_shared_auth()
-                    if self._recent_shared_auth():
-                        return
-                now = time.monotonic()
-                if self._last_auth_attempt_ts and now - self._last_auth_attempt_ts < self.auth_min_interval_sec:
-                    sleep_sec = max(0.5, self.auth_min_interval_sec - (now - self._last_auth_attempt_ts))
-                else:
-                    sleep_sec = 0.0
-                if sleep_sec > 0:
-                    logger.info("Auth throttled, waiting %.2fs before retry", sleep_sec)
-            if sleep_sec > 0:
-                time.sleep(sleep_sec)
-            self._last_auth_attempt_ts = time.monotonic()
             try:
                 response = self.sess.post(
                     f"{self.base_url}/authentication",
@@ -272,35 +68,22 @@ class WorldQuantBrainClient:
                     timeout=self.timeout_sec,
                 )
             except requests.RequestException as exc:
+                sleep_sec = min(30, 2 ** (attempt - 1))
                 if attempt < max_retries:
-                    sleep_sec = min(30, 2 ** (attempt - 1))
-                    self._reset_session()
                     logger.warning("Auth request error (%s), retrying in %ss", exc, sleep_sec)
                     time.sleep(sleep_sec)
                     continue
                 raise RuntimeError(f"Authentication failed: {exc}") from exc
-            last_response = response
 
+            last_response = response
             if response.status_code in (200, 201):
                 token = response.headers.get("X-WQB-Session-Token")
                 if token:
                     self.sess.headers.update({"X-WQB-Session-Token": token})
-                with cls._auth_lock:
-                    cls._shared_headers = {"X-WQB-Session-Token": token} if token else {}
-                    cls._shared_cookies = requests.utils.dict_from_cookiejar(self.sess.cookies)
-                    cls._shared_auth_ts = time.monotonic()
-                    self._auth_snapshot_ts = cls._shared_auth_ts
-                cls._reset_error_counters(conn=False, auth=True)
                 return
 
             if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
-                retry_after = response.headers.get("Retry-After")
-                if retry_after and retry_after.isdigit():
-                    sleep_sec = max(1, int(retry_after))
-                else:
-                    sleep_sec = min(30, 2 ** (attempt - 1))
-                if response.status_code == 429:
-                    self._note_rate_limit(sleep_sec)
+                sleep_sec = self._retry_sleep_seconds(response, attempt)
                 logger.warning(
                     "Auth transient failure %s (attempt %s/%s), retrying in %ss",
                     response.status_code,
@@ -325,57 +108,39 @@ class WorldQuantBrainClient:
         max_retries: Optional[int] = None,
         **kwargs,
     ) -> requests.Response:
+        url = url_or_path if url_or_path.startswith("http") else f"{self.base_url}{url_or_path}"
         if max_retries is None:
             max_retries = self.max_retries
-        url = url_or_path if url_or_path.startswith("http") else f"{self.base_url}{url_or_path}"
-        last_response = None
+        max_retries = max(1, int(max_retries))
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = self.timeout_sec
+
+        last_response: Optional[requests.Response] = None
 
         for attempt in range(1, max_retries + 1):
-            self._ensure_authenticated()
-            self._sync_shared_auth()
-            if self.__class__._force_close and self.sess.headers.get("Connection") != "close":
-                self.sess.headers.update({"Connection": "close"})
-            is_meta = any(token in url for token in ("/data-sets", "/data-fields", "/operators"))
-            if is_meta:
-                self._throttle(self.metadata_min_interval_sec, self.metadata_jitter_sec, "meta")
-            else:
-                self._throttle(self.min_request_interval_sec, self.request_jitter_sec, "global")
+            if self.auto_auth and not url.endswith("/authentication"):
+                self._ensure_authenticated()
+
             try:
-                sem = self.__class__._inflight_sem
-                if sem is None:
-                    response = self.sess.request(method, url, timeout=self.timeout_sec, **kwargs)
-                else:
-                    with sem:
-                        response = self.sess.request(method, url, timeout=self.timeout_sec, **kwargs)
+                response = self.sess.request(method, url, **kwargs)
             except requests.RequestException as exc:
+                last_response = None
+                sleep_sec = min(30, 2 ** (attempt - 1))
                 if attempt < max_retries:
-                    sleep_sec = min(30, 2 ** (attempt - 1))
-                    self._reset_session()
-                    self._note_connect_failure(sleep_sec)
                     logger.warning("Request error on %s %s (%s), retry in %ss", method, url, exc, sleep_sec)
                     time.sleep(sleep_sec)
                     continue
-                raise RuntimeError(f"Request failed: {method} {url} {exc}") from exc
+                raise RuntimeError(f"Request failed: {exc}") from exc
+
             last_response = response
-            if response.status_code < 400:
-                self._reset_error_counters(conn=True, auth=True)
 
             if response.status_code == 401 and retry_auth and attempt < max_retries:
-                self._note_auth_error()
                 logger.warning("401 received on %s %s, re-authenticating and retrying", method, url)
-                if self._recent_shared_auth():
-                    sleep_sec = max(0.5, self.auth_min_interval_sec * 0.5)
-                    time.sleep(sleep_sec)
-                    self._sync_shared_auth()
-                else:
-                    self._reset_session()
-                    self.authenticate()
+                self.authenticate()
                 continue
 
             if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
                 sleep_sec = self._retry_sleep_seconds(response, attempt)
-                if response.status_code == 429:
-                    self._note_rate_limit(sleep_sec)
                 logger.warning(
                     "Transient status %s on %s %s (attempt %s/%s), retry in %ss",
                     response.status_code,
@@ -395,14 +160,11 @@ class WorldQuantBrainClient:
         return last_response
 
     @staticmethod
-    def _retry_sleep_seconds(response: requests.Response, attempt: int) -> float:
+    def _retry_sleep_seconds(response: requests.Response, attempt: int) -> int:
         retry_after = response.headers.get("Retry-After")
         if retry_after and retry_after.isdigit():
-            base = max(1, int(retry_after))
-        else:
-            base = min(30, 2 ** (attempt - 1))
-        jitter = random.uniform(0.0, min(1.0, base * 0.25))
-        return base + jitter
+            return max(1, int(retry_after))
+        return min(30, 2 ** (attempt - 1))
 
     @staticmethod
     def _parse_retry_after(response: requests.Response) -> Optional[float]:
@@ -471,14 +233,15 @@ class WorldQuantBrainClient:
     def _reset_session(self) -> None:
         headers = dict(self.sess.headers)
         auth = self.sess.auth
+        cookies = self.sess.cookies
         try:
             self.sess.close()
         except Exception:
             pass
         self.sess = requests.Session()
         self.sess.headers.update(headers)
+        self.sess.cookies.update(cookies)
         self.sess.auth = auth
-        self._sync_shared_auth()
 
     def _clone_client(self) -> "WorldQuantBrainClient":
         client = self.__class__(
@@ -488,8 +251,10 @@ class WorldQuantBrainClient:
             base_url=self.base_url,
             max_retries=self.max_retries,
             auto_auth=self.auto_auth,
+            disable_proxy=self.disable_proxy,
         )
-        client._sync_shared_auth()
+        client.sess.headers.update(self.sess.headers)
+        client.sess.cookies.update(self.sess.cookies)
         return client
 
     def get_datasets(
@@ -1237,14 +1002,14 @@ class WorldQuantBrainClient:
             progress = self._request("GET", progress_url)
             if progress.status_code != 200:
                 retry_after = self._parse_retry_after(progress)
-                time.sleep(retry_after if retry_after is not None else self._poll_sleep_seconds(poll_interval_sec))
+                time.sleep(retry_after if retry_after is not None else max(1.0, float(poll_interval_sec)))
                 continue
             body = progress.json()
             if "alpha" in body and body["alpha"]:
                 alpha_id = str(body["alpha"]).rstrip("/").split("/")[-1]
                 break
             retry_after = self._parse_retry_after(progress)
-            time.sleep(retry_after if retry_after is not None else self._poll_sleep_seconds(poll_interval_sec))
+            time.sleep(retry_after if retry_after is not None else max(1.0, float(poll_interval_sec)))
 
         if not alpha_id:
             return SimulationResult(
@@ -1419,15 +1184,14 @@ class WorldQuantBrainClient:
         tasks = [asyncio.create_task(run_one(alpha_id)) for alpha_id in alpha_ids]
         return await asyncio.gather(*tasks, return_exceptions=return_exceptions)
 
-    @staticmethod
-    def _poll_sleep_seconds(poll_interval_sec: int) -> float:
-        base = max(1.0, float(poll_interval_sec))
-        jitter = min(1.0, base * 0.2)
-        return base + random.uniform(0.0, jitter)
-
 
 def _to_float(value) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _env_flag(name: str) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
