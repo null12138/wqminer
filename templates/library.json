@@ -14,5 +14,11 @@
   "-days_from_last_change(rp_ess_insider)",
   "ts_mean(ts_rank(divide(sedol, ts_mean(sedol, 20)), 10), 60)",
   "-ts_mean(ts_rank(sedol, 20), 60)",
-  "rank(-ts_backfill(zscore(goodwill/sales), 65) * (rank(fn_accrued_liab_a) + rank(capex) + rank(dividend / sharesout) + rank(debt_st)))"
+  "rank(-ts_backfill(zscore(goodwill/sales), 65) * (rank(fn_accrued_liab_a) + rank(capex) + rank(dividend / sharesout) + rank(debt_st)))",
+  "-(scale(quantile(zscore(days_from_last_change(rp_css_credit)), driver=gaussian, sigma=1.0)))",
+  "-(ts_count_nans(actual_eps_value_quarterly,20))",
+  "trade_when(less(0.85, rank(news_mov_vol)), -zscore(ts_sum(news_max_up_ret,10)), ts_delay(-zscore(ts_sum(news_max_up_ret,10)),1))",
+  "-(days_from_last_change(rp_css_insider))",
+  "-inverse(max(cash_st,1))",
+  "-winsorize(days_from_last_change(rp_ess_price), std=4)"
 ]
