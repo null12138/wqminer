@@ -78,7 +78,11 @@ def generate_inspiration_text(
         user_prompt += f"\nStyle seed: {style_seed}\n"
     user_prompt += "\nReturn only the inspiration text."
 
-    raw = llm.generate(system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.7)
+    try:
+        raw = llm.generate(system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.7)
+    except Exception as exc:
+        logging.warning("Inspiration generation failed: %s", exc)
+        return ""
     cleaned = _clean_inspiration_text(raw)
     if max_chars > 0 and len(cleaned) > max_chars:
         return cleaned[:max_chars].rstrip()
@@ -293,7 +297,11 @@ def generate_reflection_text(
         + "\n\nReturn a short reflection and next guidance."
     )
 
-    raw = llm.generate(system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.4)
+    try:
+        raw = llm.generate(system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.4)
+    except Exception as exc:
+        logging.warning("Reflection generation failed: %s", exc)
+        return ""
     cleaned = _clean_inspiration_text(raw)
     if max_chars > 0 and len(cleaned) > max_chars:
         return cleaned[:max_chars].rstrip()

@@ -28,6 +28,16 @@ def _env_float(name: str, default: float = 0.0) -> float:
         return default
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
 class WorldQuantBrainClient:
     BASE_URL = "https://api.worldquantbrain.com"
     PLATFORM_ALPHA_URL = "https://platform.worldquantbrain.com/alpha/"
@@ -40,6 +50,16 @@ class WorldQuantBrainClient:
     _global_last_rate_limit_ts = 0.0
     _global_rate_limit_hits = 0
     _global_rate_limit_window_start = 0.0
+    _conn_error_threshold = _env_int("WQMINER_CONN_ERROR_THRESHOLD", 6)
+    _conn_error_window_sec = _env_float("WQMINER_CONN_ERROR_WINDOW", 60.0)
+    _conn_error_cooldown_sec = _env_float("WQMINER_CONN_ERROR_COOLDOWN", 30.0)
+    _auth_error_threshold = _env_int("WQMINER_AUTH_ERROR_THRESHOLD", 4)
+    _auth_error_window_sec = _env_float("WQMINER_AUTH_ERROR_WINDOW", 60.0)
+    _auth_error_cooldown_sec = _env_float("WQMINER_AUTH_ERROR_COOLDOWN", 12.0)
+    _consecutive_conn_errors = 0
+    _last_conn_error_ts = 0.0
+    _consecutive_auth_errors = 0
+    _last_auth_error_ts = 0.0
     _shared_auth_ts = 0.0
     _shared_headers: Dict[str, str] = {}
     _shared_cookies: Dict[str, str] = {}
@@ -60,6 +80,8 @@ class WorldQuantBrainClient:
         self.sess = requests.Session()
         self.sess.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
         self.sess.auth = HTTPBasicAuth(username, password)
+        if os.getenv("WQMINER_DISABLE_KEEPALIVE", "").strip().lower() in {"1", "true", "yes"}:
+            self.sess.headers.update({"Connection": "close"})
         self.min_request_interval_sec = _env_float("WQMINER_MIN_REQUEST_INTERVAL", 0.0)
         self.request_jitter_sec = _env_float("WQMINER_REQUEST_JITTER", 0.0)
         self.metadata_min_interval_sec = _env_float("WQMINER_METADATA_MIN_INTERVAL", 0.0)
@@ -93,12 +115,46 @@ class WorldQuantBrainClient:
             return
         now = time.monotonic()
         with cls._global_lock:
+            if cls._last_conn_error_ts == 0.0 or now - cls._last_conn_error_ts > cls._conn_error_window_sec:
+                cls._consecutive_conn_errors = 0
+            cls._consecutive_conn_errors += 1
+            cls._last_conn_error_ts = now
+
             cooldown = now + min(8.0, sleep_sec)
+            if cls._consecutive_conn_errors >= cls._conn_error_threshold:
+                extra = min(cls._conn_error_cooldown_sec, cls._consecutive_conn_errors * 2.0)
+                cooldown = max(cooldown, now + extra)
+                floor = min(10.0, max(1.0, extra * 0.5))
+                if floor > cls._global_min_interval_floor:
+                    cls._global_min_interval_floor = floor
             if cooldown > cls._global_cooldown_until:
                 cls._global_cooldown_until = cooldown
             floor = min(4.0, max(0.5, sleep_sec * 0.5))
             if floor > cls._global_min_interval_floor:
                 cls._global_min_interval_floor = floor
+
+    @classmethod
+    def _note_auth_error(cls) -> None:
+        now = time.monotonic()
+        with cls._global_lock:
+            if cls._last_auth_error_ts == 0.0 or now - cls._last_auth_error_ts > cls._auth_error_window_sec:
+                cls._consecutive_auth_errors = 0
+            cls._consecutive_auth_errors += 1
+            cls._last_auth_error_ts = now
+            if cls._consecutive_auth_errors >= cls._auth_error_threshold:
+                cooldown = now + cls._auth_error_cooldown_sec
+                if cooldown > cls._global_cooldown_until:
+                    cls._global_cooldown_until = cooldown
+
+    @classmethod
+    def _reset_error_counters(cls, conn: bool = True, auth: bool = True) -> None:
+        with cls._global_lock:
+            if conn:
+                cls._consecutive_conn_errors = 0
+                cls._last_conn_error_ts = 0.0
+            if auth:
+                cls._consecutive_auth_errors = 0
+                cls._last_auth_error_ts = 0.0
 
     @classmethod
     def _throttle(cls, min_interval_sec: float, jitter_sec: float, bucket: str) -> None:
@@ -260,8 +316,11 @@ class WorldQuantBrainClient:
                     continue
                 raise RuntimeError(f"Request failed: {method} {url} {exc}") from exc
             last_response = response
+            if response.status_code < 400:
+                self._reset_error_counters(conn=True, auth=True)
 
             if response.status_code == 401 and retry_auth and attempt < max_retries:
+                self._note_auth_error()
                 logger.warning("401 received on %s %s, re-authenticating and retrying", method, url)
                 if self._recent_shared_auth():
                     sleep_sec = max(0.5, self.auth_min_interval_sec * 0.5)
