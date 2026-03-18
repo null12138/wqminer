@@ -381,6 +381,31 @@ HTML_PAGE = """<!doctype html>
             <option value="1">1</option>
           </select>
         </div>
+        <div class="config-item">
+          <label for="cfg-concurrency-profile">Parallel Profile</label>
+          <select id="cfg-concurrency-profile">
+            <option value="advisor">advisor (50+)</option>
+            <option value="balanced">balanced</option>
+            <option value="safe">safe</option>
+            <option value="custom">custom</option>
+          </select>
+        </div>
+        <div class="config-item">
+          <label for="cfg-concurrency">Concurrency</label>
+          <input id="cfg-concurrency" type="number" min="1" step="1" placeholder="56" />
+        </div>
+        <div class="config-item">
+          <label for="cfg-concurrency-cap">Concurrency Cap</label>
+          <input id="cfg-concurrency-cap" type="number" min="0" step="1" placeholder="0=unlimited" />
+        </div>
+        <div class="config-item">
+          <label for="cfg-template-count">Template Count</label>
+          <input id="cfg-template-count" type="number" min="1" step="1" placeholder="64" />
+        </div>
+        <div class="config-item">
+          <label for="cfg-poll-interval">Poll Interval(s)</label>
+          <input id="cfg-poll-interval" type="number" min="1" step="1" placeholder="10" />
+        </div>
       </div>
       <div class="dataset-actions">
         <select id="cfg-preset"></select>
@@ -493,6 +518,11 @@ HTML_PAGE = """<!doctype html>
     const cfgRegion = document.getElementById("cfg-region");
     const cfgUniverse = document.getElementById("cfg-universe");
     const cfgDelay = document.getElementById("cfg-delay");
+    const cfgConcurrencyProfile = document.getElementById("cfg-concurrency-profile");
+    const cfgConcurrency = document.getElementById("cfg-concurrency");
+    const cfgConcurrencyCap = document.getElementById("cfg-concurrency-cap");
+    const cfgTemplateCount = document.getElementById("cfg-template-count");
+    const cfgPollInterval = document.getElementById("cfg-poll-interval");
     const cfgPreset = document.getElementById("cfg-preset");
     const cfgApplyPresetBtn = document.getElementById("cfg-apply-preset");
     const cfgDatasets = document.getElementById("cfg-datasets");
@@ -748,7 +778,12 @@ HTML_PAGE = """<!doctype html>
         region: (cfgRegion.value || "").toUpperCase(),
         universe: (cfgUniverse.value || "").trim(),
         delay: parseInt(cfgDelay.value || "1", 10),
-        dataset_ids: collectDatasetIds()
+        dataset_ids: collectDatasetIds(),
+        concurrency_profile: (cfgConcurrencyProfile && cfgConcurrencyProfile.value ? String(cfgConcurrencyProfile.value).trim() : "advisor") || "advisor",
+        concurrency: parseInt(cfgConcurrency && cfgConcurrency.value ? cfgConcurrency.value : "56", 10),
+        concurrency_cap: parseInt(cfgConcurrencyCap && cfgConcurrencyCap.value ? cfgConcurrencyCap.value : "0", 10),
+        template_count: parseInt(cfgTemplateCount && cfgTemplateCount.value ? cfgTemplateCount.value : "64", 10),
+        poll_interval: parseInt(cfgPollInterval && cfgPollInterval.value ? cfgPollInterval.value : "10", 10)
       };
       try {
         const resp = await fetch("/api/config", {
@@ -763,6 +798,11 @@ HTML_PAGE = """<!doctype html>
         const cfg = data.config || {};
         cfgUniverse.value = cfg.universe || cfgUniverse.value;
         cfgDelay.value = String(cfg.delay != null ? cfg.delay : cfgDelay.value || "1");
+        if (cfgConcurrencyProfile) cfgConcurrencyProfile.value = String(cfg.concurrency_profile || "advisor");
+        if (cfgConcurrency) cfgConcurrency.value = String(cfg.concurrency != null ? cfg.concurrency : (cfgConcurrency.value || "56"));
+        if (cfgConcurrencyCap) cfgConcurrencyCap.value = String(cfg.concurrency_cap != null ? cfg.concurrency_cap : (cfgConcurrencyCap.value || "0"));
+        if (cfgTemplateCount) cfgTemplateCount.value = String(cfg.template_count != null ? cfg.template_count : (cfgTemplateCount.value || "64"));
+        if (cfgPollInterval) cfgPollInterval.value = String(cfg.poll_interval != null ? cfg.poll_interval : (cfgPollInterval.value || "10"));
         if (cfg.dataset_presets) {
           populatePresetOptions(cfg.dataset_presets, cfg.region || cfgRegion.value, cfg.universe || cfgUniverse.value, cfg.delay != null ? cfg.delay : cfgDelay.value);
         } else {
@@ -794,6 +834,11 @@ HTML_PAGE = """<!doctype html>
         populateRegionOptions(cfg.supported_regions || [], cfg.region || "USA");
         cfgUniverse.value = cfg.universe || "";
         cfgDelay.value = String(cfg.delay != null ? cfg.delay : 1);
+        if (cfgConcurrencyProfile) cfgConcurrencyProfile.value = String(cfg.concurrency_profile || "advisor");
+        if (cfgConcurrency) cfgConcurrency.value = String(cfg.concurrency != null ? cfg.concurrency : 56);
+        if (cfgConcurrencyCap) cfgConcurrencyCap.value = String(cfg.concurrency_cap != null ? cfg.concurrency_cap : 0);
+        if (cfgTemplateCount) cfgTemplateCount.value = String(cfg.template_count != null ? cfg.template_count : 64);
+        if (cfgPollInterval) cfgPollInterval.value = String(cfg.poll_interval != null ? cfg.poll_interval : 10);
         populatePresetOptions(cfg.dataset_presets || [], cfg.region || "USA", cfg.universe || "", cfg.delay != null ? cfg.delay : 1);
         setManualDatasetIds(cfg.dataset_ids || []);
         setConfigState("配置已加载");
@@ -1151,6 +1196,26 @@ HTML_PAGE = """<!doctype html>
       } catch (err) {
         setConfigState(`应用预设失败: ${err}`);
       }
+    });
+    on(cfgConcurrencyProfile, "change", () => {
+      const profile = String(cfgConcurrencyProfile.value || "advisor").toLowerCase();
+      if (profile === "advisor") {
+        if (cfgConcurrency) cfgConcurrency.value = String(Math.max(56, parseInt(cfgConcurrency.value || "56", 10) || 56));
+        if (cfgConcurrencyCap && (!cfgConcurrencyCap.value || parseInt(cfgConcurrencyCap.value || "0", 10) < parseInt(cfgConcurrency.value || "56", 10))) {
+          cfgConcurrencyCap.value = cfgConcurrency.value;
+        }
+        if (cfgTemplateCount) cfgTemplateCount.value = String(Math.max(64, parseInt(cfgTemplateCount.value || "64", 10) || 64));
+        if (cfgPollInterval) cfgPollInterval.value = String(Math.min(parseInt(cfgPollInterval.value || "10", 10) || 10, 10));
+      } else if (profile === "balanced") {
+        if (cfgConcurrency) cfgConcurrency.value = String(Math.max(16, parseInt(cfgConcurrency.value || "16", 10) || 16));
+        if (cfgTemplateCount) cfgTemplateCount.value = String(Math.max(24, parseInt(cfgTemplateCount.value || "24", 10) || 24));
+        if (cfgPollInterval) cfgPollInterval.value = String(Math.min(parseInt(cfgPollInterval.value || "15", 10) || 15, 15));
+      } else if (profile === "safe") {
+        if (cfgConcurrency) cfgConcurrency.value = String(Math.min(parseInt(cfgConcurrency.value || "8", 10) || 8, 8));
+        if (cfgConcurrencyCap) cfgConcurrencyCap.value = String(Math.min(parseInt(cfgConcurrencyCap.value || "8", 10) || 8, 8));
+        if (cfgPollInterval) cfgPollInterval.value = String(Math.max(parseInt(cfgPollInterval.value || "15", 10) || 15, 15));
+      }
+      note(`已切换并发档位: ${profile}`);
     });
     on(exportBtn, "click", exportData);
     on(cfgSaveBtn, "click", async () => {
@@ -1775,12 +1840,22 @@ class FlowController:
         delay = int(_get(cfg, "delay", 1))
         dataset_ids = _normalize_dataset_ids(_get(cfg, "dataset_ids", []))
         dataset_presets = _normalize_dataset_presets(_get(cfg, "dataset_presets", list(DEFAULT_DATASET_PRESETS)))
+        concurrency = max(1, int(_get(cfg, "concurrency", 56)))
+        concurrency_cap = max(0, int(_get(cfg, "concurrency_cap", 0)))
+        concurrency_profile = str(_get(cfg, "concurrency_profile", "advisor"))
+        template_count = max(1, int(_get(cfg, "template_count", 64)))
+        poll_interval = max(1, int(_get(cfg, "poll_interval", 10)))
         return {
             "region": region,
             "universe": universe,
             "delay": delay,
             "dataset_ids": dataset_ids,
             "dataset_presets": dataset_presets,
+            "concurrency": concurrency,
+            "concurrency_cap": concurrency_cap,
+            "concurrency_profile": concurrency_profile,
+            "template_count": template_count,
+            "poll_interval": poll_interval,
             "config_path": self.config_path,
             "results_dir": self.results_dir,
             "library_path": self.library_path,
@@ -1802,12 +1877,22 @@ class FlowController:
             delay = max(0, delay)
             dataset_ids = _normalize_dataset_ids(payload.get("dataset_ids", _get(cfg, "dataset_ids", [])))
             dataset_presets = _normalize_dataset_presets(payload.get("dataset_presets", _get(cfg, "dataset_presets", list(DEFAULT_DATASET_PRESETS))))
+            concurrency = max(1, _parse_int(str(payload.get("concurrency", _get(cfg, "concurrency", 56))), int(_get(cfg, "concurrency", 56))))
+            concurrency_cap = max(0, _parse_int(str(payload.get("concurrency_cap", _get(cfg, "concurrency_cap", 0))), int(_get(cfg, "concurrency_cap", 0))))
+            concurrency_profile = str(payload.get("concurrency_profile", _get(cfg, "concurrency_profile", "advisor"))).strip() or "advisor"
+            template_count = max(1, _parse_int(str(payload.get("template_count", _get(cfg, "template_count", 64))), int(_get(cfg, "template_count", 64))))
+            poll_interval = max(1, _parse_int(str(payload.get("poll_interval", _get(cfg, "poll_interval", 10))), int(_get(cfg, "poll_interval", 10))))
 
             cfg["region"] = region
             cfg["universe"] = universe
             cfg["delay"] = delay
             cfg["dataset_ids"] = dataset_ids
             cfg["dataset_presets"] = dataset_presets
+            cfg["concurrency"] = concurrency
+            cfg["concurrency_cap"] = concurrency_cap
+            cfg["concurrency_profile"] = concurrency_profile
+            cfg["template_count"] = template_count
+            cfg["poll_interval"] = poll_interval
 
             self._write_config(cfg)
             self._apply_paths_from_config(cfg)
@@ -1818,6 +1903,11 @@ class FlowController:
             "delay": delay,
             "dataset_ids": dataset_ids,
             "dataset_presets": dataset_presets,
+            "concurrency": concurrency,
+            "concurrency_cap": concurrency_cap,
+            "concurrency_profile": concurrency_profile,
+            "template_count": template_count,
+            "poll_interval": poll_interval,
             "supported_regions": SUPPORTED_REGIONS,
             "default_universe_map": dict(DEFAULT_UNIVERSE),
         }
@@ -1968,15 +2058,16 @@ class FlowController:
                 credentials_path=_get(cfg, "credentials", ""),
                 username=_get(cfg, "username", ""),
                 password=_get(cfg, "password", ""),
-                template_count=int(_get(cfg, "template_count", 20)),
+                template_count=int(_get(cfg, "template_count", 64)),
                 style_prompt=_get(cfg, "style", ""),
                 inspiration=_get(cfg, "inspiration", ""),
                 output_dir=output_dir,
-                concurrency=int(_get(cfg, "concurrency", 3)),
+                concurrency=int(_get(cfg, "concurrency", 56)),
+                concurrency_profile=str(_get(cfg, "concurrency_profile", "advisor")),
                 async_mode=bool(_get(cfg, "async_mode", False)),
                 timeout_sec=int(_get(cfg, "timeout_sec", 60)),
                 max_retries=int(_get(cfg, "max_retries", 5)),
-                poll_interval_sec=int(_get(cfg, "poll_interval", 30)),
+                poll_interval_sec=int(_get(cfg, "poll_interval", 10)),
                 max_wait_sec=int(_get(cfg, "max_wait", 600)),
                 max_rounds=int(_get(cfg, "max_rounds", 0)),
                 sleep_between_rounds=int(_get(cfg, "sleep_between_rounds", 5)),

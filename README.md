@@ -27,9 +27,11 @@ python3 run.py --config run_config.json
 ```
 
 ## Key config knobs
-- `concurrency`: number of parallel simulations (default 3)
+- `concurrency_profile`: parallel profile (`advisor`/`balanced`/`safe`/`custom`); default `advisor` auto-lifts legacy low concurrency
+- `concurrency`: requested parallel simulations
+- `concurrency_cap`: hard cap for parallel simulations (0 = no cap)
 - `batch_size`: fixed expressions per round (`8` recommended for strict optimization batches)
-- `poll_interval`: seconds between status polls (default 30)
+- `poll_interval`: seconds between status polls
 - `timeout_sec`: HTTP timeout per request (default 90)
 - `max_retries`: request retries for transient errors (default 8)
 - `max_rounds`: 0 = infinite
@@ -94,7 +96,7 @@ One process handles everything: start/stop the flow + query results.
 bash start_web.sh
 ```
 Then open `http://localhost:8002` in your browser.
-WebUI now supports selecting `region/universe/delay`, applying preset combos (USA/ASI/JPN etc.), loading dataset list from cache or live API, multi-selecting `dataset_ids`, fallback manual `dataset_ids` input when API fails, and persisting them into `run_config.json` before start.
+WebUI now supports selecting `region/universe/delay`, parallel profile + concurrency knobs (advisor/balanced/safe/custom), applying preset combos (USA/ASI/JPN etc.), loading dataset list from cache or live API, multi-selecting `dataset_ids`, fallback manual `dataset_ids` input when API fails, and persisting them into `run_config.json` before start.
 
 Optional overrides:
 ```bash

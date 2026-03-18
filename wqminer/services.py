@@ -300,6 +300,58 @@ def _summarize_results(rows: Sequence[Dict[str, float]]) -> Dict[str, float]:
     }
 
 
+def _resolve_parallel_runtime(
+    *,
+    concurrency_profile: str,
+    concurrency: int,
+    concurrency_cap: int,
+    poll_interval_sec: int,
+    template_count: int,
+    batch_size: int,
+) -> Dict[str, int | str]:
+    profile = str(concurrency_profile or "advisor").strip().lower()
+    requested = max(1, int(concurrency))
+    cap = max(0, int(concurrency_cap))
+    poll = max(1, int(poll_interval_sec))
+    templates = max(1, int(template_count))
+    fixed_batch = int(batch_size)
+
+    if profile in {"advisor", "consultant", "aggressive", "turbo", "high"}:
+        # Advisor accounts can run large parallel sets; lift legacy defaults.
+        requested = max(requested, 56)
+        if cap <= 0 or cap < requested:
+            cap = requested
+        poll = min(poll, 10)
+        if fixed_batch <= 0:
+            templates = max(templates, requested)
+    elif profile in {"balanced", "standard"}:
+        requested = max(requested, 16)
+        if cap > 0 and cap < requested:
+            cap = requested
+        poll = min(poll, 15)
+        if fixed_batch <= 0:
+            templates = max(templates, requested)
+    elif profile in {"safe", "legacy"}:
+        requested = min(requested, 8)
+        if cap > 0:
+            cap = min(cap, requested)
+        poll = max(poll, 15)
+    else:
+        # custom/auto: keep user values, but avoid cap<concurrency mismatch.
+        if cap > 0 and cap < requested:
+            cap = requested
+
+    effective = requested if cap <= 0 else min(requested, cap)
+    return {
+        "profile": profile,
+        "requested_concurrency": requested,
+        "concurrency_cap": cap,
+        "effective_concurrency": effective,
+        "poll_interval_sec": poll,
+        "template_count": templates,
+    }
+
+
 def generate_reflection_text(
     llm_config_path: str,
     region: str,
@@ -1438,6 +1490,7 @@ def run_one_click(
     inspiration: str = "",
     output_dir: str = "results/one_click",
     concurrency: int = 3,
+    concurrency_profile: str = "advisor",
     async_mode: bool = False,
     timeout_sec: int = 60,
     max_retries: int = 5,
@@ -1485,6 +1538,28 @@ def run_one_click(
     universe = universe or get_default_universe(region)
     neutralization = get_default_neutralization(region)
     selected_dataset_ids = _normalize_dataset_ids(dataset_ids)
+    runtime = _resolve_parallel_runtime(
+        concurrency_profile=concurrency_profile,
+        concurrency=concurrency,
+        concurrency_cap=concurrency_cap,
+        poll_interval_sec=poll_interval_sec,
+        template_count=template_count,
+        batch_size=batch_size,
+    )
+    effective_concurrency = int(runtime["effective_concurrency"])
+    effective_cap = int(runtime["concurrency_cap"])
+    effective_poll_interval = int(runtime["poll_interval_sec"])
+    effective_template_count = int(runtime["template_count"])
+
+    logging.info(
+        "Parallel profile=%s requested=%s cap=%s effective=%s poll=%ss template_count=%s",
+        runtime["profile"],
+        runtime["requested_concurrency"],
+        effective_cap,
+        effective_concurrency,
+        effective_poll_interval,
+        effective_template_count,
+    )
 
     user, pwd = resolve_credentials(credentials_path, username, password, required=True)
 
@@ -1589,7 +1664,8 @@ def run_one_click(
             if int(batch_size) > 0:
                 per_round = int(batch_size)
             else:
-                per_round = evolve_count if evolve_count and int(evolve_count) > 0 else template_count
+                base_count = evolve_count if evolve_count and int(evolve_count) > 0 else effective_template_count
+                per_round = max(1, int(base_count))
             style = base_style if not reflection else merge_style_prompt(base_style, reflection)
             if progress_cb:
                 progress_cb({"stage": "generate", "round": round_idx, "total": 0, "completed": 0, "success": 0, "failed": 0, "last": {}})
@@ -1627,10 +1703,10 @@ def run_one_click(
                     timeout_sec=timeout_sec,
                     max_retries=max_retries,
                     settings=settings,
-                    poll_interval_sec=poll_interval_sec,
+                    poll_interval_sec=effective_poll_interval,
                     max_wait_sec=max_wait_sec,
-                    concurrency=concurrency,
-                    concurrency_cap=concurrency_cap,
+                    concurrency=effective_concurrency,
+                    concurrency_cap=effective_cap,
                     disable_proxy=disable_proxy,
                     progress_cb=progress_cb,
                     round_idx=round_idx,
@@ -1644,10 +1720,10 @@ def run_one_click(
                     max_retries=max_retries,
                     expressions=expressions,
                     settings=settings,
-                    poll_interval_sec=poll_interval_sec,
+                    poll_interval_sec=effective_poll_interval,
                     max_wait_sec=max_wait_sec,
-                    concurrency=concurrency,
-                    concurrency_cap=concurrency_cap,
+                    concurrency=effective_concurrency,
+                    concurrency_cap=effective_cap,
                     disable_proxy=disable_proxy,
                     progress_cb=progress_cb,
                     round_idx=round_idx,
@@ -1679,10 +1755,10 @@ def run_one_click(
                         timeout_sec=timeout_sec,
                         max_retries=max_retries,
                         settings=settings,
-                        poll_interval_sec=poll_interval_sec,
+                        poll_interval_sec=effective_poll_interval,
                         max_wait_sec=max_wait_sec,
-                        concurrency=concurrency,
-                        concurrency_cap=concurrency_cap,
+                        concurrency=effective_concurrency,
+                        concurrency_cap=effective_cap,
                         disable_proxy=disable_proxy,
                         progress_cb=progress_cb,
                         round_idx=round_idx,
@@ -1696,10 +1772,10 @@ def run_one_click(
                         max_retries=max_retries,
                         expressions=reverse_candidates,
                         settings=settings,
-                        poll_interval_sec=poll_interval_sec,
+                        poll_interval_sec=effective_poll_interval,
                         max_wait_sec=max_wait_sec,
-                        concurrency=concurrency,
-                        concurrency_cap=concurrency_cap,
+                        concurrency=effective_concurrency,
+                        concurrency_cap=effective_cap,
                         disable_proxy=disable_proxy,
                         progress_cb=progress_cb,
                         round_idx=round_idx,
@@ -1739,4 +1815,5 @@ def run_one_click(
         "results_append_file": str(append_path) if append_path else "",
         "fields_cache": fields_cache,
         "dataset_ids": selected_dataset_ids,
+        "parallel_runtime": runtime,
     }
