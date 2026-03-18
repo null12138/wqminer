@@ -34,6 +34,9 @@ templates/*.json
 # Bundles / build
 build/
 dist/
+target/
+remote_submitter/target/
+remote_submitter/.env
 
 # Playwright
 *.har

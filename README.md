@@ -26,6 +26,45 @@ Then run:
 python3 run.py --config run_config.json
 ```
 
+## Decoupled Architecture (Local Producer + Remote Rust Submitter)
+Goal:
+- Local machine only generates/validates templates.
+- Remote server only consumes queue jobs and submits/simulates.
+- Queue/state persist in Supabase PostgreSQL for stable querying/auditing.
+
+### 1) Create Supabase schema
+Apply SQL:
+```sql
+\i infra/supabase/schema.sql
+```
+Or copy content from `infra/supabase/schema.sql` into Supabase SQL editor.
+
+### 2) Local producer mode
+Generate a batch locally and optionally enqueue to Supabase:
+```bash
+python3 produce_templates.py --config run_config.json --count 64
+python3 produce_templates.py --config run_config.json --count 64 --enqueue \
+  --supabase-url "$SUPABASE_URL" \
+  --supabase-service-key "$SUPABASE_SERVICE_ROLE_KEY"
+```
+Output is written to `results/producer/produced_batch_*.json`.
+
+### 3) Remote Rust submitter mode
+Build/run on remote server:
+```bash
+cd remote_submitter
+cp .env.example .env
+cargo run --release
+```
+Detailed runtime knobs: `remote_submitter/README.md`.
+Remote submitter behavior:
+- claims `queued/retry` jobs with `FOR UPDATE SKIP LOCKED`
+- strictly processes from old to new (`created_at ASC`)
+- continuously refills worker slots (no batch barrier)
+- runs high concurrency simulation/submit
+- writes status + metrics back to `alpha_jobs`
+- local producer changes do not impact running remote submitter binary
+
 ## Key config knobs
 - `concurrency_profile`: parallel profile (`advisor`/`balanced`/`safe`/`custom`); default `advisor` auto-lifts legacy low concurrency
 - `concurrency`: requested parallel simulations
@@ -54,6 +93,10 @@ Strict preflight knobs (optional):
 - `dataset_field_max_pages`: max field pages per selected dataset
 - `dataset_field_page_limit`: page size when pulling selected-dataset fields
 - `results_append_file`: append each round's core result rows to a text file
+- `producer_output_dir`: local producer output directory
+- `supabase_url`: Supabase URL for queue enqueue
+- `supabase_service_role_key`: service-role key for producer enqueue
+- `queue_batch_table` / `queue_job_table`: queue table names
 
 ## Auto-append to library
 Results with `sharpe >= 1.2` and `fitness >= 1.0` are appended to `templates/library.json` (deduped).
