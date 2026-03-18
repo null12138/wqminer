@@ -94,7 +94,7 @@ One process handles everything: start/stop the flow + query results.
 bash start_web.sh
 ```
 Then open `http://localhost:8002` in your browser.
-WebUI now supports selecting `region/universe/delay`, loading dataset list from cache or live API, multi-selecting `dataset_ids`, and persisting them into `run_config.json` before start.
+WebUI now supports selecting `region/universe/delay`, loading dataset list from cache or live API, multi-selecting `dataset_ids`, fallback manual `dataset_ids` input when API fails, and persisting them into `run_config.json` before start.
 
 Optional overrides:
 ```bash

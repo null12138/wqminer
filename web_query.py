@@ -188,6 +188,30 @@ HTML_PAGE = """<!doctype html>
       font-size: 12px;
       background: #0b111a;
     }
+    .dataset-toolbar {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      margin-top: 8px;
+      align-items: center;
+    }
+    .dataset-quick-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .dataset-manual {
+      width: 100%;
+      min-height: 84px;
+      resize: vertical;
+      font-size: 12px;
+      background: #0b111a;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 10px;
+      box-sizing: border-box;
+    }
     .dataset-actions {
       display: flex;
       gap: 8px;
@@ -363,12 +387,25 @@ HTML_PAGE = """<!doctype html>
         <button id="ds-refresh">刷新数据集</button>
       </div>
       <div class="hint-line" id="dataset-meta">数据集未加载</div>
+      <div class="dataset-toolbar">
+        <input id="ds-search" placeholder="筛选 dataset id / 分类 / 名称" />
+        <div class="dataset-quick-actions">
+          <button id="ds-select-all" class="secondary">全选可见</button>
+          <button id="ds-clear" class="secondary">清空选择</button>
+        </div>
+      </div>
       <div class="row wrap-top" style="margin-top: 10px;">
         <div style="flex: 1 1 560px;">
           <select id="cfg-datasets" class="dataset-select" multiple></select>
         </div>
       </div>
-      <div class="hint-line">提示：可多选数据集。启动前会自动保存当前 region/universe/delay + dataset_ids。</div>
+      <div class="hint-line">提示：支持点选多选（无需按 Cmd/Ctrl）。启动前会自动保存当前 region/universe/delay + dataset_ids。</div>
+      <div class="row wrap-top" style="margin-top: 8px;">
+        <div style="flex: 1 1 560px;">
+          <label for="cfg-datasets-manual" class="muted">手动 dataset_ids（兜底）</label>
+          <textarea id="cfg-datasets-manual" class="dataset-manual" placeholder="接口失败或列表为空时，在这里填 dataset id（逗号/空格/换行分隔）"></textarea>
+        </div>
+      </div>
     </div>
 
     <div class="panel">
@@ -456,8 +493,12 @@ HTML_PAGE = """<!doctype html>
     const cfgSaveBtn = document.getElementById("cfg-save");
     const dsLoadBtn = document.getElementById("ds-load");
     const dsRefreshBtn = document.getElementById("ds-refresh");
+    const dsSearch = document.getElementById("ds-search");
+    const dsSelectAllBtn = document.getElementById("ds-select-all");
+    const dsClearBtn = document.getElementById("ds-clear");
     const cfgState = document.getElementById("config-state");
     const datasetMeta = document.getElementById("dataset-meta");
+    const cfgDatasetsManual = document.getElementById("cfg-datasets-manual");
 
     const COLOR_OPTIONS = [
       { label: "无", value: "" },
@@ -492,15 +533,54 @@ HTML_PAGE = """<!doctype html>
       cfgState.textContent = msg || "";
     }
 
+    function splitDatasetIds(raw) {
+      const source = Array.isArray(raw) ? raw.join("\n") : String(raw || "");
+      const parts = source.split(/[\\s,;|]+/g);
+      const out = [];
+      const seen = new Set();
+      parts.forEach((part) => {
+        const id = String(part || "").trim();
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        out.push(id);
+      });
+      return out;
+    }
+
     function selectedDatasetIds() {
-      return Array.from(cfgDatasets.selectedOptions || []).map((opt) => opt.value).filter(Boolean);
+      return Array.from(cfgDatasets.selectedOptions || []).map((opt) => String(opt.value || "").trim()).filter(Boolean);
+    }
+
+    function manualDatasetIds() {
+      return splitDatasetIds(cfgDatasetsManual && cfgDatasetsManual.value ? cfgDatasetsManual.value : "");
+    }
+
+    function collectDatasetIds() {
+      const out = [];
+      const seen = new Set();
+      [...selectedDatasetIds(), ...manualDatasetIds()].forEach((id) => {
+        const key = String(id || "").trim();
+        if (!key || seen.has(key)) return;
+        seen.add(key);
+        out.push(key);
+      });
+      return out;
+    }
+
+    function setManualDatasetIds(ids) {
+      if (!cfgDatasetsManual) return;
+      cfgDatasetsManual.value = splitDatasetIds(ids).join("\n");
     }
 
     function setSelectedDatasetIds(ids) {
-      const wanted = new Set((ids || []).map((x) => String(x)));
+      const wanted = splitDatasetIds(ids);
+      const wantedSet = new Set(wanted);
+      const optionIds = new Set(Array.from(cfgDatasets.options || []).map((opt) => String(opt.value || "").trim()).filter(Boolean));
       Array.from(cfgDatasets.options || []).forEach((opt) => {
-        opt.selected = wanted.has(opt.value);
+        opt.selected = wantedSet.has(String(opt.value || "").trim());
       });
+      const customOnly = wanted.filter((id) => !optionIds.has(id));
+      setManualDatasetIds(customOnly);
     }
 
     function populateRegionOptions(regions, current) {
@@ -516,24 +596,75 @@ HTML_PAGE = """<!doctype html>
       if (!cfgRegion.value && cfgRegion.options.length) cfgRegion.selectedIndex = 0;
     }
 
+    function normalizeDatasetRows(datasets) {
+      const out = [];
+      const seen = new Set();
+      (Array.isArray(datasets) ? datasets : []).forEach((raw) => {
+        const id = String(raw && raw.id ? raw.id : "").trim();
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        out.push({
+          id: id,
+          category: String(raw && raw.category ? raw.category : "").trim(),
+          name: String(raw && raw.name ? raw.name : "").trim(),
+          description: String(raw && raw.description ? raw.description : "").trim(),
+          custom: false
+        });
+      });
+      return out;
+    }
+
     function renderDatasetOptions(datasets, selectedIds) {
-      const selectedSet = new Set((selectedIds || []).map((x) => String(x)));
+      const selected = splitDatasetIds(selectedIds && selectedIds.length ? selectedIds : collectDatasetIds());
+      const selectedSet = new Set(selected);
+      const filter = String(dsSearch && dsSearch.value ? dsSearch.value : "").trim().toLowerCase();
+      const base = normalizeDatasetRows(datasets);
+      const baseSet = new Set(base.map((x) => x.id));
+      loadedDatasetOptions = base;
+
+      const rows = base.slice();
+      selected.forEach((id) => {
+        if (baseSet.has(id)) return;
+        rows.push({
+          id: id,
+          category: "manual",
+          name: "(自定义)",
+          description: "来自已保存或手动输入的 dataset_id",
+          custom: true
+        });
+      });
+
       cfgDatasets.innerHTML = "";
-      loadedDatasetOptions = Array.isArray(datasets) ? datasets : [];
-      loadedDatasetOptions.forEach((ds) => {
+      let visibleCount = 0;
+      rows.forEach((ds) => {
         const id = String(ds.id || "").trim();
         if (!id) return;
         const cat = String(ds.category || "").trim();
         const name = String(ds.name || "").trim();
         const desc = String(ds.description || "").trim();
         const label = [id, cat, name || desc].filter(Boolean).join(" | ");
+        const searchable = `${id} ${cat} ${name} ${desc}`.toLowerCase();
+        const isSelected = selectedSet.has(id);
+        if (filter && !searchable.includes(filter) && !isSelected) return;
         const opt = document.createElement("option");
         opt.value = id;
-        opt.textContent = label;
+        opt.textContent = ds.custom ? `${label} [manual]` : label;
         opt.title = desc || label;
-        opt.selected = selectedSet.has(id);
+        opt.selected = isSelected;
         cfgDatasets.appendChild(opt);
+        visibleCount += 1;
       });
+
+      if (visibleCount === 0) {
+        const empty = document.createElement("option");
+        empty.value = "";
+        empty.textContent = "暂无可选数据集，可点“刷新数据集”或在下方手动输入 dataset_ids";
+        empty.disabled = true;
+        cfgDatasets.appendChild(empty);
+      }
+
+      const customSelected = selected.filter((id) => !baseSet.has(id));
+      setManualDatasetIds(customSelected);
     }
 
     async function saveConfig(options = {}) {
@@ -542,7 +673,7 @@ HTML_PAGE = """<!doctype html>
         region: (cfgRegion.value || "").toUpperCase(),
         universe: (cfgUniverse.value || "").trim(),
         delay: parseInt(cfgDelay.value || "1", 10),
-        dataset_ids: selectedDatasetIds()
+        dataset_ids: collectDatasetIds()
       };
       try {
         const resp = await fetch("/api/config", {
@@ -582,8 +713,12 @@ HTML_PAGE = """<!doctype html>
         populateRegionOptions(cfg.supported_regions || [], cfg.region || "USA");
         cfgUniverse.value = cfg.universe || "";
         cfgDelay.value = String(cfg.delay != null ? cfg.delay : 1);
+        setManualDatasetIds(cfg.dataset_ids || []);
         setConfigState("配置已加载");
-        await loadDatasets(false, cfg.dataset_ids || []);
+        const dsData = await loadDatasets(false, cfg.dataset_ids || []);
+        if (!dsData || dsData.ok === false) {
+          setConfigState("配置已加载（数据集未加载，已启用手动输入）");
+        }
       } catch (err) {
         setConfigState("配置加载失败");
         datasetMeta.textContent = "配置加载失败";
@@ -604,17 +739,23 @@ HTML_PAGE = """<!doctype html>
       try {
         const resp = await fetch(`/api/datasets?${qs.toString()}`);
         const data = await resp.json();
-        if (!resp.ok || !data || !data.ok) {
+        if (!resp.ok || !data) {
           throw new Error((data && data.error) || "load datasets failed");
         }
         const datasets = data.datasets || [];
-        const selected = Array.isArray(preferredSelected) ? preferredSelected : selectedDatasetIds();
+        const selected = Array.isArray(preferredSelected) ? preferredSelected : collectDatasetIds();
         renderDatasetOptions(datasets, selected);
-        datasetMeta.textContent = `数据集 ${datasets.length} 条 | 来源 ${data.source || "-"} | ${region}/${universe || "-"} D${delay}`;
+        if (data.warning) {
+          datasetMeta.textContent = `数据集 ${datasets.length} 条 | 来源 ${data.source || "-"} | ${region}/${universe || "-"} D${delay} | 警告: ${data.warning}`;
+        } else {
+          datasetMeta.textContent = `数据集 ${datasets.length} 条 | 来源 ${data.source || "-"} | ${region}/${universe || "-"} D${delay}`;
+        }
         return data;
       } catch (err) {
-        datasetMeta.textContent = `数据集加载失败: ${err}`;
-        throw err;
+        const selected = Array.isArray(preferredSelected) ? preferredSelected : collectDatasetIds();
+        renderDatasetOptions([], selected);
+        datasetMeta.textContent = `数据集加载失败，已切换手动输入模式: ${err}`;
+        return { ok: false, error: String(err || "") };
       }
     }
 
@@ -931,6 +1072,33 @@ HTML_PAGE = """<!doctype html>
       try {
         await loadDatasets(true);
       } catch (err) {}
+    });
+    cfgDatasets.addEventListener("mousedown", (event) => {
+      const target = event.target;
+      if (!target || target.tagName !== "OPTION" || target.disabled) return;
+      event.preventDefault();
+      target.selected = !target.selected;
+    });
+    dsSearch.addEventListener("input", () => {
+      renderDatasetOptions(loadedDatasetOptions, collectDatasetIds());
+    });
+    dsSelectAllBtn.addEventListener("click", () => {
+      Array.from(cfgDatasets.options || []).forEach((opt) => {
+        if (opt.disabled || !opt.value) return;
+        opt.selected = true;
+      });
+    });
+    dsClearBtn.addEventListener("click", () => {
+      Array.from(cfgDatasets.options || []).forEach((opt) => {
+        opt.selected = false;
+      });
+      setManualDatasetIds([]);
+      note("已清空 dataset 选择");
+    });
+    cfgDatasetsManual.addEventListener("blur", () => {
+      const manual = manualDatasetIds();
+      const selected = selectedDatasetIds();
+      renderDatasetOptions(loadedDatasetOptions, [...selected, ...manual]);
     });
     cfgRegion.addEventListener("change", async () => {
       if (!cfgUniverse.value.trim()) {
@@ -1750,7 +1918,27 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = state.list_datasets(region=region, universe=universe, delay=delay, refresh=refresh)
             except Exception as exc:
-                self._send_json({"error": str(exc)}, status=500)
+                fallback_ids = _normalize_dataset_ids(snapshot.get("dataset_ids", []))
+                fallback_rows = [
+                    {
+                        "id": ds_id,
+                        "name": "",
+                        "description": "from config.dataset_ids",
+                        "category": "manual",
+                    }
+                    for ds_id in fallback_ids
+                ]
+                self._send_json(
+                    {
+                        "ok": True,
+                        "region": str(region or "USA").upper(),
+                        "universe": str(universe or ""),
+                        "delay": max(0, int(delay)),
+                        "source": "fallback",
+                        "warning": str(exc),
+                        "datasets": fallback_rows,
+                    }
+                )
                 return
             self._send_json({"ok": True, **payload})
             return
