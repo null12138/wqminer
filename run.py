@@ -65,6 +65,23 @@ def main() -> int:
         retry_failed_sleep=int(_get(cfg, "retry_failed_sleep", 2)),
         disable_proxy=bool(_get(cfg, "disable_proxy", False)),
         notify_url=_get(cfg, "notify_url", ""),
+        operator_file=_get(cfg, "operator_file", ""),
+        strict_validation=bool(_get(cfg, "strict_validation", False)),
+        max_operator_count=int(_get(cfg, "max_operator_count", 0)),
+        require_keyword_optional=bool(_get(cfg, "require_keyword_optional", True)),
+        batch_size=int(_get(cfg, "batch_size", 0)),
+        enforce_exact_batch=bool(_get(cfg, "enforce_exact_batch", False)),
+        required_theme_coverage=int(_get(cfg, "required_theme_coverage", 0)),
+        common_operator_limit=int(_get(cfg, "common_operator_limit", 0)),
+        enforce_explore_theme_pairs=bool(_get(cfg, "enforce_explore_theme_pairs", False)),
+        template_guide_path=_get(cfg, "template_guide_path", ""),
+        template_style_items=int(_get(cfg, "template_style_items", 0)),
+        template_seed_count=int(_get(cfg, "template_seed_count", 0)),
+        dataset_ids=_get(cfg, "dataset_ids", []),
+        dataset_field_max_pages=int(_get(cfg, "dataset_field_max_pages", 5)),
+        dataset_field_page_limit=int(_get(cfg, "dataset_field_page_limit", 50)),
+        results_append_file=_get(cfg, "results_append_file", ""),
+        baseline_alpha_id=_get(cfg, "baseline_alpha_id", ""),
     )
 
     for path in summary.get("files", []):

@@ -13,11 +13,13 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from wqminer.config import load_run_config
 from wqminer import services
+from wqminer.region_config import DEFAULT_UNIVERSE, get_default_universe
+from wqminer.worldquant_client import WorldQuantBrainClient
 
 
 HTML_PAGE = """<!doctype html>
@@ -98,6 +100,8 @@ HTML_PAGE = """<!doctype html>
     }
     .actions { display: flex; gap: 10px; flex-wrap: wrap; }
     .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .row.tight { gap: 8px; }
+    .row.wrap-top { align-items: flex-start; }
     .spacer { flex: 1 1 120px; }
     input, button, select {
       padding: 10px 12px;
@@ -165,6 +169,36 @@ HTML_PAGE = """<!doctype html>
       margin-bottom: 12px;
     }
     .panel-title h3 { margin: 0; font-size: 14px; letter-spacing: .3px; }
+    .config-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 10px;
+    }
+    .config-item label {
+      display: block;
+      font-size: 11px;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+      letter-spacing: 1px;
+    }
+    .dataset-select {
+      width: 100%;
+      min-height: 220px;
+      font-size: 12px;
+      background: #0b111a;
+    }
+    .dataset-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .hint-line {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
     .progress-grid { display: grid; gap: 10px; }
     .progress-bar {
       height: 10px;
@@ -303,6 +337,42 @@ HTML_PAGE = """<!doctype html>
 
     <div class="panel">
       <div class="panel-title">
+        <h3>运行配置（区域/数据集）</h3>
+        <span class="muted" id="config-state">读取中...</span>
+      </div>
+      <div class="config-grid">
+        <div class="config-item">
+          <label for="cfg-region">Region</label>
+          <select id="cfg-region"></select>
+        </div>
+        <div class="config-item">
+          <label for="cfg-universe">Universe</label>
+          <input id="cfg-universe" placeholder="例如 TOP3000 / MINVOL1M" />
+        </div>
+        <div class="config-item">
+          <label for="cfg-delay">Delay</label>
+          <select id="cfg-delay">
+            <option value="0">0</option>
+            <option value="1">1</option>
+          </select>
+        </div>
+      </div>
+      <div class="dataset-actions">
+        <button id="cfg-save" class="secondary">保存配置</button>
+        <button id="ds-load" class="secondary">读缓存数据集</button>
+        <button id="ds-refresh">刷新数据集</button>
+      </div>
+      <div class="hint-line" id="dataset-meta">数据集未加载</div>
+      <div class="row wrap-top" style="margin-top: 10px;">
+        <div style="flex: 1 1 560px;">
+          <select id="cfg-datasets" class="dataset-select" multiple></select>
+        </div>
+      </div>
+      <div class="hint-line">提示：可多选数据集。启动前会自动保存当前 region/universe/delay + dataset_ids。</div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">
         <h3>进度</h3>
         <span class="muted" id="progress-state">等待启动...</span>
       </div>
@@ -379,6 +449,15 @@ HTML_PAGE = """<!doctype html>
     const progressMeta = document.getElementById("progress-meta");
     const progressSub = document.getElementById("progress-sub");
     const progressState = document.getElementById("progress-state");
+    const cfgRegion = document.getElementById("cfg-region");
+    const cfgUniverse = document.getElementById("cfg-universe");
+    const cfgDelay = document.getElementById("cfg-delay");
+    const cfgDatasets = document.getElementById("cfg-datasets");
+    const cfgSaveBtn = document.getElementById("cfg-save");
+    const dsLoadBtn = document.getElementById("ds-load");
+    const dsRefreshBtn = document.getElementById("ds-refresh");
+    const cfgState = document.getElementById("config-state");
+    const datasetMeta = document.getElementById("dataset-meta");
 
     const COLOR_OPTIONS = [
       { label: "无", value: "" },
@@ -393,6 +472,8 @@ HTML_PAGE = """<!doctype html>
     let lastPayload = null;
     let clearTimer = null;
     let logCollapsed = false;
+    let loadedDatasetOptions = [];
+    let defaultUniverseMap = {};
 
     function formatNumber(value, digits) {
       if (typeof value !== "number" || !isFinite(value)) return "--";
@@ -405,6 +486,136 @@ HTML_PAGE = """<!doctype html>
       clearTimer = setTimeout(() => {
         saveState.textContent = " ";
       }, 2500);
+    }
+
+    function setConfigState(msg) {
+      cfgState.textContent = msg || "";
+    }
+
+    function selectedDatasetIds() {
+      return Array.from(cfgDatasets.selectedOptions || []).map((opt) => opt.value).filter(Boolean);
+    }
+
+    function setSelectedDatasetIds(ids) {
+      const wanted = new Set((ids || []).map((x) => String(x)));
+      Array.from(cfgDatasets.options || []).forEach((opt) => {
+        opt.selected = wanted.has(opt.value);
+      });
+    }
+
+    function populateRegionOptions(regions, current) {
+      const values = Array.isArray(regions) && regions.length ? regions : ["USA", "GLB", "EUR", "ASI", "CHN", "IND", "JPN", "KOR"];
+      cfgRegion.innerHTML = "";
+      values.forEach((region) => {
+        const opt = document.createElement("option");
+        opt.value = String(region).toUpperCase();
+        opt.textContent = String(region).toUpperCase();
+        cfgRegion.appendChild(opt);
+      });
+      if (current) cfgRegion.value = String(current).toUpperCase();
+      if (!cfgRegion.value && cfgRegion.options.length) cfgRegion.selectedIndex = 0;
+    }
+
+    function renderDatasetOptions(datasets, selectedIds) {
+      const selectedSet = new Set((selectedIds || []).map((x) => String(x)));
+      cfgDatasets.innerHTML = "";
+      loadedDatasetOptions = Array.isArray(datasets) ? datasets : [];
+      loadedDatasetOptions.forEach((ds) => {
+        const id = String(ds.id || "").trim();
+        if (!id) return;
+        const cat = String(ds.category || "").trim();
+        const name = String(ds.name || "").trim();
+        const desc = String(ds.description || "").trim();
+        const label = [id, cat, name || desc].filter(Boolean).join(" | ");
+        const opt = document.createElement("option");
+        opt.value = id;
+        opt.textContent = label;
+        opt.title = desc || label;
+        opt.selected = selectedSet.has(id);
+        cfgDatasets.appendChild(opt);
+      });
+    }
+
+    async function saveConfig(options = {}) {
+      const silent = !!options.silent;
+      const payload = {
+        region: (cfgRegion.value || "").toUpperCase(),
+        universe: (cfgUniverse.value || "").trim(),
+        delay: parseInt(cfgDelay.value || "1", 10),
+        dataset_ids: selectedDatasetIds()
+      };
+      try {
+        const resp = await fetch("/api/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data || !data.ok) {
+          throw new Error((data && data.error) || "save failed");
+        }
+        const cfg = data.config || {};
+        cfgUniverse.value = cfg.universe || cfgUniverse.value;
+        cfgDelay.value = String(cfg.delay != null ? cfg.delay : cfgDelay.value || "1");
+        setSelectedDatasetIds(cfg.dataset_ids || payload.dataset_ids || []);
+        if (!silent) {
+          setConfigState("配置已保存");
+          note("配置已保存");
+        }
+        return cfg;
+      } catch (err) {
+        setConfigState("保存失败");
+        if (!silent) note("配置保存失败");
+        throw err;
+      }
+    }
+
+    async function loadConfig() {
+      try {
+        const resp = await fetch("/api/config");
+        const data = await resp.json();
+        if (!resp.ok || !data || !data.ok) {
+          throw new Error((data && data.error) || "load config failed");
+        }
+        const cfg = data.config || {};
+        defaultUniverseMap = cfg.default_universe_map || {};
+        populateRegionOptions(cfg.supported_regions || [], cfg.region || "USA");
+        cfgUniverse.value = cfg.universe || "";
+        cfgDelay.value = String(cfg.delay != null ? cfg.delay : 1);
+        setConfigState("配置已加载");
+        await loadDatasets(false, cfg.dataset_ids || []);
+      } catch (err) {
+        setConfigState("配置加载失败");
+        datasetMeta.textContent = "配置加载失败";
+      }
+    }
+
+    async function loadDatasets(refresh, preferredSelected) {
+      const region = (cfgRegion.value || "USA").toUpperCase();
+      const universe = (cfgUniverse.value || "").trim();
+      const delay = parseInt(cfgDelay.value || "1", 10);
+      const qs = new URLSearchParams({
+        region: region,
+        universe: universe,
+        delay: String(delay),
+        refresh: refresh ? "1" : "0"
+      });
+      datasetMeta.textContent = refresh ? "刷新数据集..." : "读取数据集...";
+      try {
+        const resp = await fetch(`/api/datasets?${qs.toString()}`);
+        const data = await resp.json();
+        if (!resp.ok || !data || !data.ok) {
+          throw new Error((data && data.error) || "load datasets failed");
+        }
+        const datasets = data.datasets || [];
+        const selected = Array.isArray(preferredSelected) ? preferredSelected : selectedDatasetIds();
+        renderDatasetOptions(datasets, selected);
+        datasetMeta.textContent = `数据集 ${datasets.length} 条 | 来源 ${data.source || "-"} | ${region}/${universe || "-"} D${delay}`;
+        return data;
+      } catch (err) {
+        datasetMeta.textContent = `数据集加载失败: ${err}`;
+        throw err;
+      }
     }
 
     function hexToRgba(hex, alpha) {
@@ -689,6 +900,12 @@ HTML_PAGE = """<!doctype html>
     }
 
     startBtn.addEventListener("click", async () => {
+      try {
+        await saveConfig({ silent: true });
+      } catch (err) {
+        note("启动前保存配置失败");
+        return;
+      }
       await fetch("/api/start", { method: "POST" });
       fetchProgress();
       fetchLog();
@@ -700,6 +917,41 @@ HTML_PAGE = """<!doctype html>
     });
     runBtn.addEventListener("click", runQuery);
     exportBtn.addEventListener("click", exportData);
+    cfgSaveBtn.addEventListener("click", async () => {
+      try {
+        await saveConfig();
+      } catch (err) {}
+    });
+    dsLoadBtn.addEventListener("click", async () => {
+      try {
+        await loadDatasets(false);
+      } catch (err) {}
+    });
+    dsRefreshBtn.addEventListener("click", async () => {
+      try {
+        await loadDatasets(true);
+      } catch (err) {}
+    });
+    cfgRegion.addEventListener("change", async () => {
+      if (!cfgUniverse.value.trim()) {
+        const fallback = defaultUniverseMap[cfgRegion.value] || "";
+        if (fallback) cfgUniverse.value = fallback;
+      }
+      try {
+        await loadDatasets(false);
+      } catch (err) {}
+    });
+    cfgDelay.addEventListener("change", async () => {
+      try {
+        await loadDatasets(false);
+      } catch (err) {}
+    });
+    cfgUniverse.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        loadDatasets(false).catch(() => {});
+      }
+    });
     logToggle.addEventListener("click", () => {
       logEl.classList.toggle("collapsed");
       logCollapsed = logEl.classList.contains("collapsed");
@@ -708,6 +960,7 @@ HTML_PAGE = """<!doctype html>
       }
     });
 
+    loadConfig();
     fetchProgress();
     fetchLog();
     setInterval(fetchProgress, 2000);
@@ -860,6 +1113,114 @@ def _parse_int(value: str, default: int) -> int:
         return int(value)
     except Exception:
         return default
+
+
+SUPPORTED_REGIONS: List[str] = sorted(
+    {
+        "USA",
+        "GLB",
+        "EUR",
+        "ASI",
+        "CHN",
+        "IND",
+        "JPN",
+        "KOR",
+        "TWN",
+        "HKG",
+        *DEFAULT_UNIVERSE.keys(),
+    }
+)
+DEFAULT_DATASET_CATEGORIES: Sequence[str] = ("fundamental", "analyst", "model", "news", "alternative")
+
+
+def _safe_slug(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_-]+", "", str(value or "").strip())
+    return text or "default"
+
+
+def _normalize_dataset_ids(value: Any) -> List[str]:
+    out: List[str] = []
+    if value is None:
+        return out
+    if isinstance(value, str):
+        parts = [x.strip() for x in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        parts = [str(x).strip() for x in value]
+    else:
+        parts = [str(value).strip()]
+    seen = set()
+    for item in parts:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _dataset_cache_path(region: str, universe: str, delay: int) -> Path:
+    r = _safe_slug(str(region or "USA").upper())
+    u = _safe_slug(str(universe or "DEFAULT").upper())
+    d = max(0, int(delay))
+    return Path("data/cache") / f"datasets_{r}_{d}_{u}.json"
+
+
+def _normalize_dataset_row(raw: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    ds_id = str(raw.get("id", "") or "").strip()
+    if not ds_id:
+        return None
+    category = ""
+    cat_raw = raw.get("category")
+    if isinstance(cat_raw, dict):
+        category = str(cat_raw.get("id", "") or cat_raw.get("name", "") or "").strip()
+    else:
+        category = str(raw.get("category_id", "") or raw.get("category", "") or "").strip()
+    name = str(raw.get("name", "") or "").strip()
+    description = str(raw.get("description", "") or "").strip()
+    return {
+        "id": ds_id,
+        "name": name,
+        "description": description,
+        "category": category,
+    }
+
+
+def _load_dataset_cache(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if isinstance(payload, dict):
+        items = payload.get("datasets", [])
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        return []
+    out: List[Dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalize_dataset_row(item)
+        if normalized is None:
+            continue
+        out.append(normalized)
+    out.sort(key=lambda x: (x.get("category", ""), x.get("id", "")))
+    return out
+
+
+def _save_dataset_cache(path: Path, *, region: str, universe: str, delay: int, datasets: Sequence[Dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "region": str(region or "").upper(),
+        "universe": str(universe or ""),
+        "delay": int(delay),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "datasets": list(datasets),
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 class TagStore:
@@ -1059,6 +1420,154 @@ class FlowController:
             "updated": self._now(),
         }
 
+    def _read_config(self) -> Dict[str, Any]:
+        try:
+            cfg = load_run_config(self.config_path)
+        except Exception:
+            cfg = {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        return cfg
+
+    def _write_config(self, cfg: Dict[str, Any]) -> None:
+        target = Path(self.config_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _apply_paths_from_config(self, cfg: Dict[str, Any]) -> None:
+        output_dir = self.results_dir_override or _get(cfg, "output_dir", "results/one_click")
+        library_output = self.library_override or _get(cfg, "library_output", "templates/library.json")
+        self.results_dir = output_dir
+        self.library_path = library_output
+        self.tag_store.set_path(Path(self.results_dir) / "tags.json")
+
+    def get_config_snapshot(self) -> Dict[str, Any]:
+        with self.lock:
+            cfg = self._read_config()
+            self._apply_paths_from_config(cfg)
+        region = str(_get(cfg, "region", "USA")).upper()
+        universe = str(_get(cfg, "universe", get_default_universe(region)))
+        delay = int(_get(cfg, "delay", 1))
+        dataset_ids = _normalize_dataset_ids(_get(cfg, "dataset_ids", []))
+        return {
+            "region": region,
+            "universe": universe,
+            "delay": delay,
+            "dataset_ids": dataset_ids,
+            "config_path": self.config_path,
+            "results_dir": self.results_dir,
+            "library_path": self.library_path,
+            "running": self.running,
+            "supported_regions": SUPPORTED_REGIONS,
+            "default_universe_map": dict(DEFAULT_UNIVERSE),
+        }
+
+    def update_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be object")
+        with self.lock:
+            cfg = self._read_config()
+            region = str(payload.get("region", _get(cfg, "region", "USA"))).strip().upper() or "USA"
+            universe = str(payload.get("universe", _get(cfg, "universe", get_default_universe(region)))).strip()
+            if not universe:
+                universe = get_default_universe(region)
+            delay = _parse_int(str(payload.get("delay", _get(cfg, "delay", 1))), int(_get(cfg, "delay", 1)))
+            delay = max(0, delay)
+            dataset_ids = _normalize_dataset_ids(payload.get("dataset_ids", _get(cfg, "dataset_ids", [])))
+
+            cfg["region"] = region
+            cfg["universe"] = universe
+            cfg["delay"] = delay
+            cfg["dataset_ids"] = dataset_ids
+
+            self._write_config(cfg)
+            self._apply_paths_from_config(cfg)
+
+        return {
+            "region": region,
+            "universe": universe,
+            "delay": delay,
+            "dataset_ids": dataset_ids,
+            "supported_regions": SUPPORTED_REGIONS,
+            "default_universe_map": dict(DEFAULT_UNIVERSE),
+        }
+
+    def list_datasets(
+        self,
+        *,
+        region: str,
+        universe: str,
+        delay: int,
+        refresh: bool = False,
+    ) -> Dict[str, Any]:
+        region = str(region or "USA").upper()
+        universe = str(universe or get_default_universe(region))
+        delay = max(0, int(delay))
+        cache_path = _dataset_cache_path(region, universe, delay)
+
+        if not refresh:
+            cached = _load_dataset_cache(cache_path)
+            if cached:
+                return {
+                    "region": region,
+                    "universe": universe,
+                    "delay": delay,
+                    "source": "cache",
+                    "cache_file": str(cache_path),
+                    "datasets": cached,
+                }
+
+        cfg = self._read_config()
+        user, pwd = services.resolve_credentials(
+            credentials_path=str(_get(cfg, "credentials", "")),
+            username=str(_get(cfg, "username", "")),
+            password=str(_get(cfg, "password", "")),
+            required=True,
+        )
+        client = WorldQuantBrainClient(
+            username=user,
+            password=pwd,
+            timeout_sec=max(5, int(_get(cfg, "timeout_sec", 60))),
+            max_retries=max(1, int(_get(cfg, "max_retries", 5))),
+            disable_proxy=bool(_get(cfg, "disable_proxy", False)),
+        )
+        raw_categories = _get(cfg, "dataset_categories", list(DEFAULT_DATASET_CATEGORIES))
+        if isinstance(raw_categories, str):
+            categories = [x.strip() for x in raw_categories.split(",") if x.strip()]
+        elif isinstance(raw_categories, (list, tuple)):
+            categories = [str(x).strip() for x in raw_categories if str(x).strip()]
+        else:
+            categories = list(DEFAULT_DATASET_CATEGORIES)
+        if not categories:
+            categories = list(DEFAULT_DATASET_CATEGORIES)
+        page_limit = max(1, min(100, int(_get(cfg, "dataset_page_limit", 50))))
+        max_pages = int(_get(cfg, "dataset_max_pages", 2))
+
+        datasets = client.fetch_all_datasets(
+            region=region,
+            universe=universe,
+            delay=delay,
+            categories=categories,
+            dataset_page_limit=page_limit,
+            dataset_max_pages=max_pages,
+        )
+        normalized: List[Dict[str, str]] = []
+        for raw in datasets:
+            normalized_row = _normalize_dataset_row(raw)
+            if normalized_row is None:
+                continue
+            normalized.append(normalized_row)
+        normalized.sort(key=lambda x: (x.get("category", ""), x.get("id", "")))
+        _save_dataset_cache(cache_path, region=region, universe=universe, delay=delay, datasets=normalized)
+        return {
+            "region": region,
+            "universe": universe,
+            "delay": delay,
+            "source": "live",
+            "cache_file": str(cache_path),
+            "datasets": normalized,
+        }
+
     def _now(self) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1101,12 +1610,10 @@ class FlowController:
 
     def _run(self) -> None:
         try:
-            cfg = load_run_config(self.config_path)
-            output_dir = self.results_dir_override or _get(cfg, "output_dir", "results/one_click")
-            library_output = self.library_override or _get(cfg, "library_output", "templates/library.json")
-            self.results_dir = output_dir
-            self.library_path = library_output
-            self.tag_store.set_path(Path(self.results_dir) / "tags.json")
+            cfg = self._read_config()
+            self._apply_paths_from_config(cfg)
+            output_dir = self.results_dir
+            library_output = self.library_path
             self.update_progress(stage="setup")
 
             def progress_cb(payload: Dict) -> None:
@@ -1150,6 +1657,23 @@ class FlowController:
                 retry_failed_sleep=int(_get(cfg, "retry_failed_sleep", 2)),
                 disable_proxy=bool(_get(cfg, "disable_proxy", False)),
                 notify_url=_get(cfg, "notify_url", ""),
+                operator_file=_get(cfg, "operator_file", ""),
+                strict_validation=bool(_get(cfg, "strict_validation", False)),
+                max_operator_count=int(_get(cfg, "max_operator_count", 0)),
+                require_keyword_optional=bool(_get(cfg, "require_keyword_optional", True)),
+                batch_size=int(_get(cfg, "batch_size", 0)),
+                enforce_exact_batch=bool(_get(cfg, "enforce_exact_batch", False)),
+                required_theme_coverage=int(_get(cfg, "required_theme_coverage", 0)),
+                common_operator_limit=int(_get(cfg, "common_operator_limit", 0)),
+                enforce_explore_theme_pairs=bool(_get(cfg, "enforce_explore_theme_pairs", False)),
+                template_guide_path=_get(cfg, "template_guide_path", ""),
+                template_style_items=int(_get(cfg, "template_style_items", 0)),
+                template_seed_count=int(_get(cfg, "template_seed_count", 0)),
+                dataset_ids=_get(cfg, "dataset_ids", []),
+                dataset_field_max_pages=int(_get(cfg, "dataset_field_max_pages", 5)),
+                dataset_field_page_limit=int(_get(cfg, "dataset_field_page_limit", 50)),
+                results_append_file=_get(cfg, "results_append_file", ""),
+                baseline_alpha_id=_get(cfg, "baseline_alpha_id", ""),
                 progress_cb=progress_cb,
                 stop_event=self.stop_event,
             )
@@ -1201,6 +1725,34 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        if parsed.path == "/api/config":
+            state = APP_STATE
+            if not state:
+                self._send_json({"error": "state not ready"}, status=500)
+                return
+            self._send_json({"ok": True, "config": state.get_config_snapshot()})
+            return
+
+        if parsed.path == "/api/datasets":
+            state = APP_STATE
+            if not state:
+                self._send_json({"error": "state not ready"}, status=500)
+                return
+            qs = parse_qs(parsed.query)
+            snapshot = state.get_config_snapshot()
+            region = str((qs.get("region", [snapshot.get("region", "USA")])[0] or snapshot.get("region", "USA"))).strip()
+            universe = str((qs.get("universe", [snapshot.get("universe", "")])[0] or snapshot.get("universe", ""))).strip()
+            delay = _parse_int(str(qs.get("delay", [snapshot.get("delay", 1)])[0] or snapshot.get("delay", 1)), int(snapshot.get("delay", 1)))
+            refresh_raw = str((qs.get("refresh", ["0"])[0] or "0")).strip().lower()
+            refresh = refresh_raw in {"1", "true", "yes", "y", "on"}
+            try:
+                payload = state.list_datasets(region=region, universe=universe, delay=delay, refresh=refresh)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+                return
+            self._send_json({"ok": True, **payload})
             return
 
         if parsed.path == "/api/status":
@@ -1288,6 +1840,23 @@ class Handler(BaseHTTPRequestHandler):
         if not state:
             self._send_json({"error": "state not ready"}, status=500)
             return
+        if parsed.path == "/api/config":
+            length = _parse_int(self.headers.get("Content-Length", "0"), 0)
+            if length <= 0:
+                self._send_json({"error": "missing body"}, status=400)
+                return
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except Exception:
+                self._send_json({"error": "invalid json"}, status=400)
+                return
+            try:
+                config = state.update_config(payload if isinstance(payload, dict) else {})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"ok": True, "config": config})
+            return
         if parsed.path == "/api/start":
             msg = state.start()
             self._send_json({"ok": True, "message": msg})
@@ -1320,7 +1889,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args) -> None:
         msg = fmt % args
-        if "/api/status" in msg or "/api/progress" in msg:
+        if "/api/status" in msg or "/api/progress" in msg or "/api/config" in msg or "/api/datasets" in msg:
             return
         logging.info("%s - %s", self.address_string(), msg)
 

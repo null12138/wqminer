@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import random
+import re
 import threading
 import time
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -14,7 +17,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+import requests
+
 from .config import load_credentials, load_llm_config
+from .expression_validator import validate_expression_report
 from .inspiration import merge_style_prompt
 from .llm_client import OpenAICompatibleLLM
 from .models import DataField, SimulationSettings
@@ -25,8 +31,35 @@ from .template_generator import TemplateGenerator
 from .worldquant_client import WorldQuantBrainClient
 
 
-def default_fields_cache_path(region: str, universe: str, delay: int) -> str:
-    return f"data/cache/data_fields_{region}_{delay}_{universe}.json"
+def _normalize_dataset_ids(value: Optional[Sequence[str] | str]) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = [x.strip() for x in value.split(",")]
+    else:
+        raw = [str(x).strip() for x in value]
+    out: List[str] = []
+    seen = set()
+    for item in raw:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def default_fields_cache_path(
+    region: str,
+    universe: str,
+    delay: int,
+    dataset_ids: Optional[Sequence[str] | str] = None,
+) -> str:
+    norm_ids = _normalize_dataset_ids(dataset_ids)
+    if not norm_ids:
+        return f"data/cache/data_fields_{region}_{delay}_{universe}.json"
+    digest_src = ",".join(sorted(norm_ids))
+    digest = hashlib.sha1(digest_src.encode("utf-8")).hexdigest()[:12]
+    return f"data/cache/data_fields_{region}_{delay}_{universe}_ds_{digest}.json"
 
 
 def resolve_credentials(
@@ -342,6 +375,664 @@ def _generate_expressions(
     )
     expressions = [t.expression for t in templates if t and t.expression]
     return _unique_expressions(expressions)
+
+
+def _fetch_fields_for_dataset_ids(
+    client: WorldQuantBrainClient,
+    *,
+    dataset_ids: Sequence[str],
+    region: str,
+    universe: str,
+    delay: int,
+    max_pages: int = 5,
+    page_limit: int = 50,
+) -> List[DataField]:
+    all_fields: Dict[str, DataField] = {}
+    page_limit = max(1, int(page_limit))
+    max_pages = max(1, int(max_pages))
+
+    for idx, dataset_id in enumerate(dataset_ids, start=1):
+        dsid = str(dataset_id or "").strip()
+        if not dsid:
+            continue
+        logging.info("Fetching fields from selected dataset %s (%s/%s)", dsid, idx, len(dataset_ids))
+        page = 1
+        while page <= max_pages:
+            try:
+                rows = client.get_data_fields(
+                    dataset_id=dsid,
+                    region=region,
+                    universe=universe,
+                    delay=delay,
+                    page=page,
+                    limit=page_limit,
+                )
+            except requests.HTTPError:
+                break
+            if not rows:
+                break
+            for raw in rows:
+                parsed = DataField.from_api(raw)
+                if not parsed.field_id:
+                    continue
+                all_fields[parsed.field_id] = parsed
+            if len(rows) < page_limit:
+                break
+            page += 1
+
+    filtered: List[DataField] = []
+    for field in all_fields.values():
+        if field.region and field.region != region:
+            continue
+        if field.universe and field.universe != universe:
+            continue
+        if field.delay and int(field.delay) != int(delay):
+            continue
+        filtered.append(field)
+    return sorted(filtered, key=lambda x: x.field_id)
+
+
+def _normalize_template_line(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if "模板:" in text:
+        text = text.split("模板:", 1)[1].strip()
+    if "#" in text:
+        text = text.split("#", 1)[0].strip()
+    text = text.rstrip(";").strip()
+    if not text:
+        return ""
+    if text.startswith("|") or text.startswith("```") or text.startswith("---"):
+        return ""
+    if text in {"```", "'''"}:
+        return ""
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=\s*$", text):
+        return ""
+    return text
+
+
+def _load_tempmd_templates(path: str, max_items: int = 500) -> List[str]:
+    src = Path(path or "").expanduser()
+    if not src.exists() or not src.is_file():
+        return []
+    try:
+        content = src.read_text(encoding="utf-8")
+    except Exception as exc:
+        logging.warning("Failed to read template guide %s: %s", src, exc)
+        return []
+
+    out: List[str] = []
+    seen = set()
+    for line in content.splitlines():
+        if "模板:" in line:
+            cand = _normalize_template_line(line)
+            if cand and cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+            if len(out) >= max_items:
+                return out
+
+    in_code = False
+    block_lines: List[str] = []
+    for raw in content.splitlines():
+        line = raw.rstrip("\n")
+        if line.strip().startswith("```"):
+            if in_code:
+                for b in block_lines:
+                    cand = _normalize_template_line(b)
+                    if not cand:
+                        continue
+                    if cand not in seen:
+                        seen.add(cand)
+                        out.append(cand)
+                        if len(out) >= max_items:
+                            return out
+                block_lines = []
+                in_code = False
+            else:
+                in_code = True
+            continue
+        if in_code:
+            block_lines.append(line)
+    return out
+
+
+def _build_template_style_snippet(lines: Sequence[str], max_items: int = 16, max_chars: int = 2400) -> str:
+    if not lines or max_items <= 0:
+        return ""
+    take = min(len(lines), max(1, int(max_items)))
+    picks = random.sample(list(lines), take) if len(lines) > take else list(lines)
+    snippet_lines: List[str] = []
+    total_chars = 0
+    for item in picks:
+        if not item:
+            continue
+        line = f"- {item}"
+        if total_chars + len(line) > max_chars:
+            break
+        snippet_lines.append(line)
+        total_chars += len(line)
+    if not snippet_lines:
+        return ""
+    return (
+        "Template guide (from temp.md):\n"
+        "Follow these structures but only use operators/fields that are currently available.\n"
+        + "\n".join(snippet_lines)
+    )
+
+
+def _field_pools_for_templates(fields: Sequence[DataField]) -> Dict[str, List[str]]:
+    matrix_fields: List[str] = []
+    vector_fields: List[str] = []
+    sentiment_fields: List[str] = []
+    analyst_fields: List[str] = []
+    model_fields: List[str] = []
+    fundamental_fields: List[str] = []
+    option_fields: List[str] = []
+    price_volume_fields: List[str] = []
+    group_fields = ["industry", "sector", "subindustry", "market", "country"]
+
+    for f in fields:
+        fid = str(f.field_id or "").strip()
+        if not fid:
+            continue
+        lfid = fid.lower()
+        ftype = str(f.field_type or "").upper()
+        if "VECTOR" in ftype or lfid.startswith(("anl4_", "oth41_", "scl12_", "nws", "mws")):
+            vector_fields.append(fid)
+        else:
+            matrix_fields.append(fid)
+
+        if lfid.startswith(("scl", "snt", "nws", "mws")):
+            sentiment_fields.append(fid)
+        if lfid.startswith(("anl4_", "oth41_", "analyst_")):
+            analyst_fields.append(fid)
+        if lfid.startswith(("mdl", "model")):
+            model_fields.append(fid)
+        if lfid.startswith(("fnd", "eps", "sales", "assets", "roe", "roa", "debt", "ebitda", "net_income", "gross_profit")):
+            fundamental_fields.append(fid)
+        if lfid.startswith(("option", "implied_volatility", "parkinson_volatility", "pcr_vol", "put_", "call_")):
+            option_fields.append(fid)
+        if lfid in {"open", "high", "low", "close", "returns", "volume", "adv20", "sharesout", "cap", "vwap"}:
+            price_volume_fields.append(fid)
+
+    if not matrix_fields:
+        matrix_fields = ["close", "returns", "volume", "cap", "vwap", "adv20"]
+    if not vector_fields:
+        vector_fields = ["anl4_eps_mean", "scl12_alltype_buzzvec", "oth41_s_west_eps_ftm_chg_3m"]
+    if not sentiment_fields:
+        sentiment_fields = ["scl12_sentiment", "scl12_buzz"]
+    if not analyst_fields:
+        analyst_fields = ["anl4_eps_mean", "anl4_revenue_mean"]
+    if not model_fields:
+        model_fields = ["mdl175_01dtsv", "mdl175_01icc"]
+    if not fundamental_fields:
+        fundamental_fields = ["eps", "sales", "assets", "net_income", "roe", "roa"]
+    if not option_fields:
+        option_fields = ["implied_volatility_call_120", "pcr_vol_30", "put_delta", "call_delta"]
+    if not price_volume_fields:
+        price_volume_fields = ["close", "open", "high", "low", "returns", "volume", "adv20", "sharesout", "cap", "vwap"]
+
+    return {
+        "matrix": _unique_expressions(matrix_fields),
+        "vector": _unique_expressions(vector_fields),
+        "sentiment": _unique_expressions(sentiment_fields),
+        "analyst": _unique_expressions(analyst_fields),
+        "model": _unique_expressions(model_fields),
+        "fundamental": _unique_expressions(fundamental_fields),
+        "option": _unique_expressions(option_fields),
+        "pv": _unique_expressions(price_volume_fields),
+        "group": group_fields,
+    }
+
+
+def _choose_placeholder_value(
+    token: str,
+    *,
+    operators: set,
+    pools: Dict[str, List[str]],
+) -> str:
+    key = str(token or "").strip().lower()
+
+    def pick(items: Sequence[str], default: str) -> str:
+        values = [str(x).strip() for x in items if str(x).strip()]
+        if not values:
+            return default
+        return random.choice(values)
+
+    def pick_op(candidates: Sequence[str], default: str) -> str:
+        available = [op for op in candidates if op in operators]
+        return pick(available, default if default in operators else (available[0] if available else default))
+
+    if key.startswith("ts_op"):
+        return pick_op(
+            [
+                "ts_rank",
+                "ts_zscore",
+                "ts_delta",
+                "ts_ir",
+                "ts_mean",
+                "ts_std_dev",
+                "ts_decay_linear",
+                "ts_decay_exp_window",
+                "ts_corr",
+            ],
+            "ts_rank",
+        )
+    if key.startswith("group_op"):
+        return pick_op(["group_rank", "group_neutralize", "group_zscore"], "group_rank")
+    if key.startswith("vec_op"):
+        return pick_op(["vec_avg", "vec_sum", "vec_max", "vec_min", "vec_stddev", "vec_count"], "vec_avg")
+
+    if "vector" in key or "analyst" in key or key in {"sentiment_vec"}:
+        return pick(pools.get("vector", []), "anl4_eps_mean")
+    if "sentiment" in key:
+        return pick(pools.get("sentiment", []), "scl12_sentiment")
+    if "model" in key:
+        return pick(pools.get("model", []), "mdl175_01dtsv")
+    if "fundamental" in key or "profit_field" in key or "size_field" in key or "leverage_field" in key:
+        return pick(pools.get("fundamental", []), "eps")
+    if "option" in key or "greek" in key or "pcr" in key or "volatility" in key or "breakeven" in key:
+        return pick(pools.get("option", []), "implied_volatility_call_120")
+    if "price" in key or "ret_field" in key or "volume_field" in key:
+        return pick(pools.get("pv", []), "close")
+    if key.startswith("field"):
+        return pick(pools.get("matrix", []), "close")
+    if key in {"alpha", "signal"}:
+        return "ts_rank(close, 22)"
+    if key in {"group", "group1", "group2"}:
+        return pick(pools.get("group", []), "industry")
+
+    if key == "d":
+        return pick(["5", "22", "66", "126", "252"], "22")
+    if key in {"d1", "d2", "d3", "d_short", "d_long", "d_backfill", "decay_d"}:
+        return pick(["5", "10", "22", "66", "126", "252"], "22")
+    if key in {"k"}:
+        return pick(["2", "3", "4", "0.3", "0.5"], "2")
+    if "threshold" in key:
+        return pick(["0.05", "0.1", "0.2", "0.5", "0.8"], "0.1")
+    if key in {"std"}:
+        return pick(["3", "4", "5"], "4")
+    if key in {"range"}:
+        return "0.1,1,0.1"
+    if key in {"factor", "f"}:
+        return pick(["0.04", "0.1", "0.5", "0.9"], "0.5")
+    if key in {"target", "target_tvr"}:
+        return pick(["0.1", "0.15", "0.2"], "0.1")
+    if key in {"weight1", "weight2"}:
+        return pick(["0.33", "0.5", "0.67"], "0.5")
+
+    if key in {"low"}:
+        return pick(["0.1", "0.25"], "0.1")
+    if key in {"high"}:
+        return pick(["100", "1000"], "100")
+    if key in {"c"}:
+        return pick(["0.05", "0.1"], "0.1")
+    if key in {"p", "q"}:
+        return pick(["0.25", "0.5", "0.75"], "0.5")
+    if key in {"min_count"}:
+        return pick(["2", "3", "5"], "3")
+    if key in {"position"}:
+        return pick(["0", "1"], "0")
+    if key in {"days", "window"}:
+        return pick(["1", "2", "5", "10"], "5")
+
+    return "22" if key.startswith("d") else "close"
+
+
+def _instantiate_template_line(line: str, *, operators: set, pools: Dict[str, List[str]]) -> str:
+    text = _normalize_template_line(line)
+    if not text:
+        return ""
+    # Skip pure assignment lines for seed expressions.
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", text):
+        return ""
+
+    def repl_angle(match: re.Match) -> str:
+        token = match.group(1)
+        return _choose_placeholder_value(token, operators=operators, pools=pools)
+
+    def repl_brace(match: re.Match) -> str:
+        token = match.group(1)
+        return _choose_placeholder_value(token, operators=operators, pools=pools)
+
+    text = re.sub(r"<\s*([A-Za-z0-9_]+)\s*/\s*>", repl_angle, text)
+    text = re.sub(r"\{([A-Za-z0-9_]+)\}", repl_brace, text)
+    text = " ".join(text.split())
+    text = text.rstrip(";").strip()
+    if not text:
+        return ""
+    if "<" in text or "{" in text:
+        return ""
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", text):
+        return ""
+    if "模板" in text:
+        return ""
+    if not TemplateGenerator._is_balanced(text):
+        return ""
+    return text
+
+
+def _render_template_seed_expressions(
+    template_lines: Sequence[str],
+    *,
+    fields: Sequence[DataField],
+    operators: Sequence[Dict],
+    count: int,
+) -> List[str]:
+    if not template_lines or count <= 0:
+        return []
+    operator_names = {str(op.get("name", "")).strip() for op in operators if op.get("name")}
+    pools = _field_pools_for_templates(fields)
+    picks = random.sample(list(template_lines), min(len(template_lines), max(count * 3, count)))
+    out: List[str] = []
+    seen = set()
+    for line in picks:
+        expr = _instantiate_template_line(line, operators=operator_names, pools=pools)
+        if not expr or expr in seen:
+            continue
+        seen.add(expr)
+        out.append(expr)
+        if len(out) >= count:
+            break
+    return out
+
+
+_THEME_OPERATOR_GROUPS = {
+    "A": {"trade_when", "keep", "if_else", "nan_mask"},
+    "B": {
+        "days_from_last_change",
+        "filter",
+        "group_backfill",
+        "hump",
+        "hump_decay",
+        "jump_decay",
+        "kth_element",
+        "last_diff_value",
+        "ts_backfill",
+    },
+    "C": {"clamp", "left_tail", "nan_out", "pasteurize", "purify", "replace", "right_tail", "tail", "truncate", "winsorize"},
+    "D": {
+        "group_multi_regression",
+        "group_vector_neut",
+        "group_vector_proj",
+        "multi_regression",
+        "regression_neut",
+        "regression_proj",
+        "ts_poly_regression",
+        "ts_regression",
+        "ts_theilsen",
+        "ts_vector_neut",
+        "ts_vector_proj",
+        "vector_neut",
+        "vector_proj",
+    },
+    "E": {"ts_co_kurtosis", "ts_co_skewness", "ts_corr", "ts_covariance", "ts_partial_corr", "ts_triple_corr"},
+    "F": {
+        "inst_pnl",
+        "inst_tvr",
+        "one_side",
+        "rank_by_side",
+        "scale",
+        "scale_down",
+        "ts_delta_limit",
+        "ts_target_tvr_decay",
+        "ts_target_tvr_delta_limit",
+        "ts_target_tvr_hump",
+    },
+}
+
+_COMMON_OPERATOR_SET = {
+    "ts_sum",
+    "ts_mean",
+    "rank",
+    "zscore",
+    "winsorize",
+    "ts_std_dev",
+    "scale",
+    "round",
+    "trade_when",
+}
+
+
+def _batch_constraint_violations(
+    expressions: Sequence[str],
+    reports: Dict[str, Dict],
+    *,
+    target_count: int = 0,
+    enforce_exact_batch: bool = False,
+    required_theme_coverage: int = 0,
+    common_operator_limit: int = 0,
+    enforce_explore_theme_pairs: bool = False,
+) -> List[str]:
+    violations: List[str] = []
+    total = len(expressions)
+    if enforce_exact_batch and int(target_count) > 0 and total != int(target_count):
+        violations.append(f"batch size {total} != required {int(target_count)}")
+    if total == 0:
+        violations.append("empty batch")
+        return violations
+
+    usage: Dict[str, int] = {}
+    expr_ops: List[set] = []
+    for expr in expressions:
+        ops = set(reports.get(expr, {}).get("operators_used") or [])
+        expr_ops.append(ops)
+        for op in ops:
+            usage[op] = usage.get(op, 0) + 1
+
+    if int(common_operator_limit) > 0:
+        capped = int(common_operator_limit)
+        over = sorted((op, cnt) for op, cnt in usage.items() if op in _COMMON_OPERATOR_SET and cnt > capped)
+        if over:
+            violations.append(
+                "common operator cap exceeded: "
+                + ", ".join(f"{op}={cnt}" for op, cnt in over)
+                + f" (limit={capped})"
+            )
+
+    if int(required_theme_coverage) > 0:
+        covered = {
+            theme
+            for theme, theme_ops in _THEME_OPERATOR_GROUPS.items()
+            if any(op in theme_ops for op in usage.keys())
+        }
+        need = int(required_theme_coverage)
+        if len(covered) < need:
+            violations.append(
+                f"theme coverage {len(covered)} < required {need} (covered={','.join(sorted(covered)) or 'none'})"
+            )
+
+    if enforce_explore_theme_pairs and total >= 8:
+        pair_seen = set()
+        for idx in range(5, 8):
+            ops = expr_ops[idx]
+            themes = sorted([theme for theme, theme_ops in _THEME_OPERATOR_GROUPS.items() if ops.intersection(theme_ops)])
+            if len(themes) < 2:
+                violations.append(f"candidate #{idx + 1} has <2 theme operators")
+                continue
+            pair = tuple(themes[:2])
+            if pair in pair_seen:
+                violations.append(f"duplicate explore theme pair {pair} in candidate #{idx + 1}")
+            pair_seen.add(pair)
+
+    return violations
+
+
+def _select_batch_from_pool(
+    pool: Sequence[str],
+    reports: Dict[str, Dict],
+    *,
+    target_count: int,
+    enforce_exact_batch: bool,
+    required_theme_coverage: int,
+    common_operator_limit: int,
+    enforce_explore_theme_pairs: bool,
+) -> Tuple[List[str], List[str]]:
+    if target_count <= 0:
+        return [], ["target_count must be positive"]
+    if len(pool) < target_count:
+        return [], [f"valid pool {len(pool)} < required {target_count}"]
+
+    trial_batches: List[List[str]] = [list(pool[:target_count])]
+    if len(pool) > target_count:
+        sample_tries = min(240, max(24, len(pool) * 10))
+        for _ in range(sample_tries):
+            trial_batches.append(random.sample(list(pool), target_count))
+
+    best: List[str] = []
+    best_violations: List[str] = []
+    seen = set()
+    for batch in trial_batches:
+        sig = tuple(batch)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        violations = _batch_constraint_violations(
+            batch,
+            reports,
+            target_count=target_count,
+            enforce_exact_batch=enforce_exact_batch,
+            required_theme_coverage=required_theme_coverage,
+            common_operator_limit=common_operator_limit,
+            enforce_explore_theme_pairs=enforce_explore_theme_pairs,
+        )
+        if not violations:
+            return batch, []
+        if not best_violations or len(violations) < len(best_violations):
+            best = batch
+            best_violations = violations
+    return [], (best_violations or ["unable to satisfy batch constraints"])
+
+
+def _prepare_candidate_batch(
+    *,
+    generator: TemplateGenerator,
+    region: str,
+    fields: Sequence[DataField],
+    count: int,
+    style_prompt: str,
+    operators: Sequence[Dict],
+    operator_file: str = "",
+    strict_validation: bool = False,
+    max_operator_count: int = 0,
+    require_keyword_optional: bool = True,
+    enforce_exact_batch: bool = False,
+    required_theme_coverage: int = 0,
+    common_operator_limit: int = 0,
+    enforce_explore_theme_pairs: bool = False,
+    template_lines: Optional[Sequence[str]] = None,
+    template_style_items: int = 0,
+    template_seed_count: int = 0,
+    max_generate_attempts: int = 8,
+) -> Tuple[List[str], Dict[str, Dict]]:
+    target = max(1, int(count))
+    pool: List[str] = []
+    reports: Dict[str, Dict] = {}
+    seen = set()
+    last_violations: List[str] = []
+
+    def add_candidate(expr: str) -> None:
+        expr = str(expr or "").strip()
+        if not expr or expr in seen:
+            return
+        seen.add(expr)
+        report = validate_expression_report(
+            expression=expr,
+            operators=operators,
+            operator_file=operator_file,
+            region=region,
+            max_operator_count=max_operator_count,
+            require_known_operators=True,
+            require_keyword_optional=require_keyword_optional,
+        )
+        reports[expr] = report
+        if strict_validation and not report.get("is_valid"):
+            logging.warning("Preflight reject: %s | %s", expr, "; ".join(report.get("errors", [])[:2]))
+            return
+        pool.append(expr)
+
+    if template_lines and int(template_seed_count) > 0:
+        seed_exprs = _render_template_seed_expressions(
+            template_lines,
+            fields=fields,
+            operators=operators,
+            count=int(template_seed_count),
+        )
+        for expr in seed_exprs:
+            add_candidate(expr)
+        if seed_exprs:
+            logging.info("Template seed candidates added: %s", len(seed_exprs))
+
+    for attempt in range(1, max(1, int(max_generate_attempts)) + 1):
+        needed = max(1, target - len(pool))
+        request_count = max(needed, min(target * 2, needed + 4))
+        attempt_style = style_prompt
+        if template_lines and int(template_style_items) > 0:
+            snippet = _build_template_style_snippet(
+                template_lines,
+                max_items=max(1, int(template_style_items)),
+            )
+            if snippet:
+                attempt_style = merge_style_prompt(style_prompt, snippet)
+        generated = _generate_expressions(generator, region, fields, request_count, attempt_style)
+
+        for expr in generated:
+            add_candidate(expr)
+
+        selected, violations = _select_batch_from_pool(
+            pool,
+            reports,
+            target_count=target,
+            enforce_exact_batch=enforce_exact_batch,
+            required_theme_coverage=required_theme_coverage,
+            common_operator_limit=common_operator_limit,
+            enforce_explore_theme_pairs=enforce_explore_theme_pairs,
+        )
+        if selected:
+            return selected, {expr: reports.get(expr, {}) for expr in selected}
+        last_violations = violations
+        logging.info(
+            "Batch preflight attempt %s/%s pending: pool=%s target=%s reason=%s",
+            attempt,
+            max(1, int(max_generate_attempts)),
+            len(pool),
+            target,
+            "; ".join(last_violations[:2]) if last_violations else "unknown",
+        )
+
+    if enforce_exact_batch:
+        raise RuntimeError(
+            "Cannot produce a compliant expression batch: "
+            + ("; ".join(last_violations) if last_violations else "insufficient valid candidates")
+        )
+
+    fallback = list(pool[:target])
+    if not fallback:
+        raise RuntimeError("No expressions generated")
+    return fallback, {expr: reports.get(expr, {}) for expr in fallback}
+
+
+def _append_round_results_file(path: Path, rows: Sequence[Dict[str, float]], *, round_idx: int, stage: str) -> str:
+    payload_time = time.strftime("%Y-%m-%d %H:%M:%S")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            payload = {
+                "time": payload_time,
+                "round": int(round_idx),
+                "stage": stage,
+                "expression": str(row.get("expression", "")).strip(),
+                "alpha_id": str(row.get("alpha_id", "")).strip(),
+                "sharpe": float(row.get("sharpe", 0.0)),
+                "fitness": float(row.get("fitness", 0.0)),
+                "turnover": float(row.get("turnover", 0.0)),
+                "success": bool(row.get("success", False)),
+                "link": str(row.get("link", "")).strip(),
+            }
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    return str(path)
 
 
 def _evaluate_expressions(
@@ -770,16 +1461,34 @@ def run_one_click(
     retry_failed_sleep: int = 2,
     disable_proxy: Optional[bool] = None,
     notify_url: str = "",
+    operator_file: str = "",
+    strict_validation: bool = False,
+    max_operator_count: int = 0,
+    require_keyword_optional: bool = True,
+    batch_size: int = 0,
+    enforce_exact_batch: bool = False,
+    required_theme_coverage: int = 0,
+    common_operator_limit: int = 0,
+    enforce_explore_theme_pairs: bool = False,
+    template_guide_path: str = "",
+    template_style_items: int = 0,
+    template_seed_count: int = 0,
+    dataset_ids: Optional[Sequence[str] | str] = None,
+    dataset_field_max_pages: int = 5,
+    dataset_field_page_limit: int = 50,
+    results_append_file: str = "",
+    baseline_alpha_id: str = "",
     progress_cb: Optional[Callable[[Dict], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> Dict:
     region = region.upper()
     universe = universe or get_default_universe(region)
     neutralization = get_default_neutralization(region)
+    selected_dataset_ids = _normalize_dataset_ids(dataset_ids)
 
     user, pwd = resolve_credentials(credentials_path, username, password, required=True)
 
-    fields_cache = default_fields_cache_path(region, universe, delay)
+    fields_cache = default_fields_cache_path(region, universe, delay, dataset_ids=selected_dataset_ids)
     if Path(fields_cache).exists():
         fields = load_data_fields_cache(fields_cache)
         logging.info("Using cached fields: %s (count=%d)", fields_cache, len(fields))
@@ -791,7 +1500,23 @@ def run_one_click(
             max_retries=max(1, int(max_retries)),
             disable_proxy=disable_proxy,
         )
-        fields = client.fetch_data_fields(region=region, universe=universe, delay=delay)
+        if selected_dataset_ids:
+            fields = _fetch_fields_for_dataset_ids(
+                client,
+                dataset_ids=selected_dataset_ids,
+                region=region,
+                universe=universe,
+                delay=delay,
+                max_pages=max(1, int(dataset_field_max_pages)),
+                page_limit=max(1, int(dataset_field_page_limit)),
+            )
+            logging.info(
+                "Fetched fields from selected datasets: %s datasets, %s fields",
+                len(selected_dataset_ids),
+                len(fields),
+            )
+        else:
+            fields = client.fetch_data_fields(region=region, universe=universe, delay=delay)
         if not fields:
             fields = client.load_fallback_default_fields()
         save_data_fields_cache(fields_cache, fields)
@@ -807,9 +1532,14 @@ def run_one_click(
             seed_expressions=seed_exprs,
         )
 
-    operators = load_operators()
+    operators = load_operators(operator_file)
     llm = OpenAICompatibleLLM(load_llm_config(llm_config_path))
     generator = TemplateGenerator(llm=llm, operators=operators)
+    template_lines = _load_tempmd_templates(template_guide_path, max_items=700) if template_guide_path else []
+    if template_lines:
+        logging.info("Loaded %s guide templates from %s", len(template_lines), template_guide_path)
+    elif template_guide_path:
+        logging.info("Template guide not found or empty: %s", template_guide_path)
 
     base_style = merge_style_prompt(style_prompt, inspiration)
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -834,6 +1564,12 @@ def run_one_click(
     results: List[Dict[str, float]] = []
     negated_seen: set = set()
     reverse_log_path = Path(reverse_log) if reverse_log else None
+    append_path: Optional[Path] = None
+    append_candidate = (results_append_file or "").strip()
+    if append_candidate:
+        append_path = Path(append_candidate)
+    elif baseline_alpha_id:
+        append_path = Path(f"{baseline_alpha_id}_optimization_results.txt")
     notify_url = (notify_url or "").strip()
     if notify_url:
         logging.info("Notify enabled: %s", notify_url.split("?")[0])
@@ -850,11 +1586,32 @@ def run_one_click(
                 logging.info("Stop requested, exiting before round %s", round_idx + 1)
                 break
             round_idx += 1
-            per_round = evolve_count if evolve_count and int(evolve_count) > 0 else template_count
+            if int(batch_size) > 0:
+                per_round = int(batch_size)
+            else:
+                per_round = evolve_count if evolve_count and int(evolve_count) > 0 else template_count
             style = base_style if not reflection else merge_style_prompt(base_style, reflection)
             if progress_cb:
                 progress_cb({"stage": "generate", "round": round_idx, "total": 0, "completed": 0, "success": 0, "failed": 0, "last": {}})
-            expressions = _generate_expressions(generator, region, fields, per_round, style)
+            expressions, _preflight_reports = _prepare_candidate_batch(
+                generator=generator,
+                region=region,
+                fields=fields,
+                count=per_round,
+                style_prompt=style,
+                operators=operators,
+                operator_file=operator_file,
+                strict_validation=bool(strict_validation),
+                max_operator_count=int(max_operator_count),
+                require_keyword_optional=bool(require_keyword_optional),
+                enforce_exact_batch=bool(enforce_exact_batch),
+                required_theme_coverage=int(required_theme_coverage),
+                common_operator_limit=int(common_operator_limit),
+                enforce_explore_theme_pairs=bool(enforce_explore_theme_pairs),
+                template_lines=template_lines,
+                template_style_items=int(template_style_items),
+                template_seed_count=int(template_seed_count),
+            )
             def row_cb(row: Dict[str, float]) -> None:
                 _maybe_notify_row(row, region, universe, delay, round_idx, notify_url, notified_seen)
             if retry_failed_rounds and int(retry_failed_rounds) > 0:
@@ -897,6 +1654,8 @@ def run_one_click(
                     stage="simulate",
                     row_cb=row_cb,
                 )
+            if append_path is not None:
+                _append_round_results_file(append_path, results, round_idx=round_idx, stage="simulate")
             reverse_candidates = _collect_reverse_candidates(
                 results,
                 sharpe_max=reverse_sharpe_max,
@@ -948,6 +1707,8 @@ def run_one_click(
                         row_cb=row_cb,
                     )
                 results.extend(negated_results)
+                if append_path is not None:
+                    _append_round_results_file(append_path, negated_results, round_idx=round_idx, stage="negate")
             files.append(_write_results_json(out_root / f"one_click_{ts}_round{round_idx:03}.json", results))
             added = _append_library(library_output, results, library_sharpe_min, library_fitness_min)
             appended += len(added)
@@ -975,4 +1736,7 @@ def run_one_click(
         "inspiration": inspiration,
         "final_count": len(results),
         "library_appended": appended,
+        "results_append_file": str(append_path) if append_path else "",
+        "fields_cache": fields_cache,
+        "dataset_ids": selected_dataset_ids,
     }
