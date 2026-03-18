@@ -12,6 +12,9 @@ cd remote_submitter
 cargo build --release
 ```
 
+Prebuilt binary in this repo:
+- `bin/remote_submitter_arm64` (macOS arm64 / Apple Silicon)
+
 ## Configure
 ```bash
 cp .env.example .env

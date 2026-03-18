@@ -1332,6 +1332,12 @@ def _get(cfg: dict, key: str, default):
     return default if value is None else value
 
 
+def _guide_path_value(cfg: dict):
+    if cfg.get("template_guide_paths"):
+        return _get(cfg, "template_guide_paths", [])
+    return _get(cfg, "template_guide_path", "")
+
+
 def _load_results(results_dir: str) -> List[Dict[str, float]]:
     root = Path(results_dir)
     if not root.exists():
@@ -2096,7 +2102,7 @@ class FlowController:
                 required_theme_coverage=int(_get(cfg, "required_theme_coverage", 0)),
                 common_operator_limit=int(_get(cfg, "common_operator_limit", 0)),
                 enforce_explore_theme_pairs=bool(_get(cfg, "enforce_explore_theme_pairs", False)),
-                template_guide_path=_get(cfg, "template_guide_path", ""),
+                template_guide_path=_guide_path_value(cfg),
                 template_style_items=int(_get(cfg, "template_style_items", 0)),
                 template_seed_count=int(_get(cfg, "template_seed_count", 0)),
                 dataset_ids=_get(cfg, "dataset_ids", []),

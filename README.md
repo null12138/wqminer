@@ -11,7 +11,7 @@ Core flow only:
 - Infinite loop by default (stop with Ctrl+C)
 
 ## Files you use
-- `run.py` (main entry, no `-m`)
+- `run.py` (unified entry, supports `--mode oneclick|produce`)
 - `run_config.example.json` (copy to `run_config.json` and edit)
 - `fetch_fields.py` (optional field fetcher with pagination + backoff)
 - `templates/library.json` (seed + auto-append library)
@@ -42,8 +42,8 @@ Or copy content from `infra/supabase/schema.sql` into Supabase SQL editor.
 ### 2) Local producer mode
 Generate a batch locally and optionally enqueue to Supabase:
 ```bash
-python3 produce_templates.py --config run_config.json --count 64
-python3 produce_templates.py --config run_config.json --count 64 --enqueue \
+python3 run.py --mode produce --config run_config.json --count 64
+python3 run.py --mode produce --config run_config.json --count 64 --enqueue \
   --supabase-url "$SUPABASE_URL" \
   --supabase-service-key "$SUPABASE_SERVICE_ROLE_KEY"
 ```
@@ -56,6 +56,9 @@ cd remote_submitter
 cp .env.example .env
 cargo run --release
 ```
+Prebuilt artifact:
+- `bin/remote_submitter_arm64` (macOS arm64)
+
 Detailed runtime knobs: `remote_submitter/README.md`.
 Remote submitter behavior:
 - claims `queued/retry` jobs with `FOR UPDATE SKIP LOCKED`
@@ -86,7 +89,8 @@ Strict preflight knobs (optional):
 - `enforce_exact_batch`: require exact `batch_size` per round
 - `required_theme_coverage`: minimum A-F theme coverage for a batch
 - `common_operator_limit`: max batch usage for common operators
-- `template_guide_path`: markdown template guide path (e.g., `temp.md`)
+- `template_guide_path`: guide file path, or comma-separated multi-path (e.g., `temp.md,dt`)
+- `template_guide_paths`: optional array form of multi-path guide config (higher priority than `template_guide_path`)
 - `template_style_items`: number of template lines injected into each generation prompt
 - `template_seed_count`: number of placeholder-rendered template seeds added before LLM generation
 - `dataset_ids`: optional selected dataset id list; when set, field cache/fetch only uses these datasets

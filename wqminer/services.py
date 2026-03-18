@@ -8,6 +8,7 @@ import json
 import logging
 import random
 import re
+import socket
 import threading
 import time
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -48,6 +49,26 @@ def _normalize_dataset_ids(value: Optional[Sequence[str] | str]) -> List[str]:
     return out
 
 
+def _normalize_guide_paths(value: Optional[Sequence[str] | str]) -> List[str]:
+    if value is None:
+        return []
+    raw: List[str] = []
+    if isinstance(value, str):
+        raw = re.split(r"[,\n]", value)
+    else:
+        for item in value:
+            raw.extend(re.split(r"[,\n]", str(item or "")))
+    out: List[str] = []
+    seen = set()
+    for item in raw:
+        path = str(item or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
 def default_fields_cache_path(
     region: str,
     universe: str,
@@ -75,6 +96,82 @@ def resolve_credentials(
     if required:
         raise ValueError("Need credentials (credentials file or username/password)")
     return "", ""
+
+
+class SupabaseQueueClient:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        service_key: str,
+        timeout_sec: int = 20,
+        batch_table: str = "alpha_batches",
+        job_table: str = "alpha_jobs",
+    ) -> None:
+        base = str(base_url or "").strip().rstrip("/")
+        key = str(service_key or "").strip()
+        if not base:
+            raise ValueError("base_url is required")
+        if not key:
+            raise ValueError("service_key is required")
+        self.base_url = base
+        self.service_key = key
+        self.timeout_sec = max(3, int(timeout_sec))
+        self.batch_table = str(batch_table or "alpha_batches").strip()
+        self.job_table = str(job_table or "alpha_jobs").strip()
+
+    def _headers(self, prefer: str = "return=representation") -> Dict[str, str]:
+        return {
+            "apikey": self.service_key,
+            "Authorization": f"Bearer {self.service_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Prefer": prefer,
+        }
+
+    def _post_rows(self, table: str, rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+        items = [dict(x) for x in rows if isinstance(x, dict)]
+        if not items:
+            return []
+        url = f"{self.base_url}/rest/v1/{table}"
+        resp = requests.post(url, headers=self._headers(), json=items, timeout=self.timeout_sec)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"Supabase insert failed ({resp.status_code}) table={table}: {resp.text}")
+        payload = resp.json()
+        return payload if isinstance(payload, list) else []
+
+    def create_batch(self, payload: Dict[str, object]) -> Dict[str, object]:
+        rows = self._post_rows(self.batch_table, [payload])
+        if not rows:
+            raise RuntimeError("Supabase create_batch returned empty result")
+        return dict(rows[0])
+
+    def enqueue_jobs(self, jobs: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+        return self._post_rows(self.job_table, jobs)
+
+
+def _ensure_output_dir(path: str) -> Path:
+    out = Path(path or "results/producer")
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _build_job_settings(
+    *,
+    region: str,
+    universe: str,
+    delay: int,
+    neutralization: str,
+) -> Dict[str, object]:
+    settings = SimulationSettings(
+        region=region,
+        universe=universe,
+        delay=delay,
+        neutralization=neutralization,
+    )
+    payload = settings.to_api_payload("__EXPR__")
+    block = payload.get("settings", {})
+    return dict(block) if isinstance(block, dict) else {}
 
 
 def generate_inspiration_text(
@@ -297,6 +394,221 @@ def _summarize_results(rows: Sequence[Dict[str, float]]) -> Dict[str, float]:
         "avg_turnover": avg_turnover,
         "success": success,
         "inactive": inactive,
+    }
+
+
+def produce_templates_only(
+    *,
+    region: str,
+    universe: str,
+    delay: int,
+    llm_config_path: str,
+    credentials_path: str = "",
+    username: str = "",
+    password: str = "",
+    template_count: int = 64,
+    style_prompt: str = "",
+    inspiration: str = "",
+    timeout_sec: int = 60,
+    max_retries: int = 5,
+    disable_proxy: Optional[bool] = None,
+    operator_file: str = "",
+    strict_validation: bool = False,
+    max_operator_count: int = 0,
+    require_keyword_optional: bool = True,
+    batch_size: int = 0,
+    enforce_exact_batch: bool = False,
+    required_theme_coverage: int = 0,
+    common_operator_limit: int = 0,
+    enforce_explore_theme_pairs: bool = False,
+    template_guide_path: Optional[Sequence[str] | str] = "",
+    template_style_items: int = 0,
+    template_seed_count: int = 0,
+    seed_templates: str = "",
+    dataset_ids: Optional[Sequence[str] | str] = None,
+    dataset_field_max_pages: int = 5,
+    dataset_field_page_limit: int = 50,
+    output_dir: str = "results/producer",
+    enqueue: bool = False,
+    queue_priority: int = 0,
+    queue_max_attempts: int = 6,
+    queue_batch_table: str = "alpha_batches",
+    queue_job_table: str = "alpha_jobs",
+    supabase_url: str = "",
+    supabase_service_key: str = "",
+) -> Dict[str, object]:
+    region = str(region or "").upper() or "USA"
+    universe = str(universe or "").strip() or get_default_universe(region)
+    delay = int(delay)
+    neutralization = get_default_neutralization(region)
+    selected_dataset_ids = _normalize_dataset_ids(dataset_ids)
+
+    user, pwd = resolve_credentials(credentials_path, username, password, required=True)
+
+    fields_cache = default_fields_cache_path(region, universe, delay, dataset_ids=selected_dataset_ids)
+    if Path(fields_cache).exists():
+        fields = load_data_fields_cache(fields_cache)
+        logging.info("Using cached fields for producer: %s (count=%d)", fields_cache, len(fields))
+    else:
+        client = WorldQuantBrainClient(
+            username=user,
+            password=pwd,
+            timeout_sec=max(5, int(timeout_sec)),
+            max_retries=max(1, int(max_retries)),
+            disable_proxy=disable_proxy,
+        )
+        if selected_dataset_ids:
+            fields = _fetch_fields_for_dataset_ids(
+                client,
+                dataset_ids=selected_dataset_ids,
+                region=region,
+                universe=universe,
+                delay=delay,
+                max_pages=max(1, int(dataset_field_max_pages)),
+                page_limit=max(1, int(dataset_field_page_limit)),
+            )
+        else:
+            fields = client.fetch_data_fields(region=region, universe=universe, delay=delay)
+        if not fields:
+            fields = client.load_fallback_default_fields()
+        save_data_fields_cache(fields_cache, fields)
+
+    if not inspiration:
+        seed_exprs = _load_seed_expressions(seed_templates)
+        inspiration = generate_inspiration_text(
+            llm_config_path=llm_config_path,
+            region=region,
+            universe=universe,
+            delay=delay,
+            style_seed=style_prompt,
+            seed_expressions=seed_exprs,
+        )
+
+    operators = load_operators(operator_file)
+    llm = OpenAICompatibleLLM(load_llm_config(llm_config_path))
+    generator = TemplateGenerator(llm=llm, operators=operators)
+    template_lines, loaded_guide_paths = _load_template_guides(template_guide_path, max_items=700)
+    if template_lines:
+        logging.info(
+            "Loaded %s guide templates from %s",
+            len(template_lines),
+            ", ".join(loaded_guide_paths),
+        )
+    elif template_guide_path:
+        logging.info("Template guide not found or empty: %s", template_guide_path)
+    style = merge_style_prompt(style_prompt, inspiration)
+    target_count = int(batch_size) if int(batch_size) > 0 else int(template_count)
+
+    expressions, preflight_reports = _prepare_candidate_batch(
+        generator=generator,
+        region=region,
+        fields=fields,
+        count=max(1, target_count),
+        style_prompt=style,
+        operators=operators,
+        operator_file=operator_file,
+        strict_validation=bool(strict_validation),
+        max_operator_count=int(max_operator_count),
+        require_keyword_optional=bool(require_keyword_optional),
+        enforce_exact_batch=bool(enforce_exact_batch),
+        required_theme_coverage=int(required_theme_coverage),
+        common_operator_limit=int(common_operator_limit),
+        enforce_explore_theme_pairs=bool(enforce_explore_theme_pairs),
+        template_lines=template_lines,
+        template_style_items=int(template_style_items),
+        template_seed_count=int(template_seed_count),
+    )
+
+    settings_payload = _build_job_settings(
+        region=region,
+        universe=universe,
+        delay=delay,
+        neutralization=neutralization,
+    )
+    produced_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    host = socket.gethostname()
+
+    jobs_payload: List[Dict[str, object]] = []
+    for expr in expressions:
+        jobs_payload.append(
+            {
+                "expression": expr,
+                "settings": settings_payload,
+                "region": region,
+                "universe": universe,
+                "delay": delay,
+                "neutralization": neutralization,
+                "language": str(settings_payload.get("language", "FASTEXPR")),
+                "status": "queued",
+                "priority": int(queue_priority),
+                "max_attempts": max(1, int(queue_max_attempts)),
+                "source": "local_producer",
+                "source_host": host,
+                "meta": {
+                    "produced_at": produced_at,
+                    "strict_validation": bool(strict_validation),
+                },
+            }
+        )
+
+    output_root = _ensure_output_dir(output_dir)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    output_file = output_root / f"produced_batch_{region}_{universe}_D{delay}_{ts}.json"
+    local_payload = {
+        "produced_at": produced_at,
+        "region": region,
+        "universe": universe,
+        "delay": delay,
+        "neutralization": neutralization,
+        "count": len(expressions),
+        "dataset_ids": selected_dataset_ids,
+        "fields_cache": fields_cache,
+        "inspiration": inspiration,
+        "expressions": expressions,
+        "jobs": jobs_payload,
+    }
+    output_file.write_text(json.dumps(local_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    queue_batch_id = ""
+    enqueued_count = 0
+    if enqueue:
+        queue = SupabaseQueueClient(
+            base_url=supabase_url,
+            service_key=supabase_service_key,
+            batch_table=queue_batch_table,
+            job_table=queue_job_table,
+        )
+        batch = queue.create_batch(
+            {
+                "region": region,
+                "universe": universe,
+                "delay": delay,
+                "neutralization": neutralization,
+                "language": str(settings_payload.get("language", "FASTEXPR")),
+                "template_count": len(expressions),
+                "producer_host": host,
+                "metadata": {
+                    "output_file": str(output_file),
+                    "fields_cache": fields_cache,
+                    "dataset_ids": selected_dataset_ids,
+                },
+            }
+        )
+        queue_batch_id = str(batch.get("id", "")).strip()
+        if queue_batch_id:
+            for item in jobs_payload:
+                item["batch_id"] = queue_batch_id
+        inserted = queue.enqueue_jobs(jobs_payload)
+        enqueued_count = len(inserted)
+
+    return {
+        "output_file": str(output_file),
+        "count": len(expressions),
+        "enqueued_count": enqueued_count,
+        "queue_batch_id": queue_batch_id,
+        "fields_cache": fields_cache,
+        "dataset_ids": selected_dataset_ids,
+        "preflight_reports": preflight_reports,
     }
 
 
@@ -550,6 +862,39 @@ def _load_tempmd_templates(path: str, max_items: int = 500) -> List[str]:
     return out
 
 
+def _load_template_guides(
+    paths: Optional[Sequence[str] | str],
+    max_items: int = 500,
+) -> Tuple[List[str], List[str]]:
+    selected_paths = _normalize_guide_paths(paths)
+    if not selected_paths:
+        return [], []
+
+    limit = max(1, int(max_items))
+    loaded_paths: List[str] = []
+    out: List[str] = []
+    seen = set()
+
+    for guide_path in selected_paths:
+        if len(out) >= limit:
+            break
+        remaining = limit - len(out)
+        rows = _load_tempmd_templates(guide_path, max_items=remaining)
+        if not rows:
+            continue
+        loaded_paths.append(guide_path)
+        for row in rows:
+            cand = _normalize_template_line(row)
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            out.append(cand)
+            if len(out) >= limit:
+                break
+
+    return out, loaded_paths
+
+
 def _build_template_style_snippet(lines: Sequence[str], max_items: int = 16, max_chars: int = 2400) -> str:
     if not lines or max_items <= 0:
         return ""
@@ -568,7 +913,7 @@ def _build_template_style_snippet(lines: Sequence[str], max_items: int = 16, max
     if not snippet_lines:
         return ""
     return (
-        "Template guide (from temp.md):\n"
+        "Template guide (from configured guide files):\n"
         "Follow these structures but only use operators/fields that are currently available.\n"
         + "\n".join(snippet_lines)
     )
@@ -1523,7 +1868,7 @@ def run_one_click(
     required_theme_coverage: int = 0,
     common_operator_limit: int = 0,
     enforce_explore_theme_pairs: bool = False,
-    template_guide_path: str = "",
+    template_guide_path: Optional[Sequence[str] | str] = "",
     template_style_items: int = 0,
     template_seed_count: int = 0,
     dataset_ids: Optional[Sequence[str] | str] = None,
@@ -1610,9 +1955,13 @@ def run_one_click(
     operators = load_operators(operator_file)
     llm = OpenAICompatibleLLM(load_llm_config(llm_config_path))
     generator = TemplateGenerator(llm=llm, operators=operators)
-    template_lines = _load_tempmd_templates(template_guide_path, max_items=700) if template_guide_path else []
+    template_lines, loaded_guide_paths = _load_template_guides(template_guide_path, max_items=700)
     if template_lines:
-        logging.info("Loaded %s guide templates from %s", len(template_lines), template_guide_path)
+        logging.info(
+            "Loaded %s guide templates from %s",
+            len(template_lines),
+            ", ".join(loaded_guide_paths),
+        )
     elif template_guide_path:
         logging.info("Template guide not found or empty: %s", template_guide_path)
 

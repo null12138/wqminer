@@ -36,6 +36,7 @@
   "common_operator_limit": 2,
   "enforce_explore_theme_pairs": false,
   "template_guide_path": "temp.md",
+  "template_guide_paths": [],
   "template_style_items": 18,
   "template_seed_count": 16,
   "dataset_ids": [],
