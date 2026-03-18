@@ -827,7 +827,9 @@ HTML_PAGE = """<!doctype html>
         const datasets = data.datasets || [];
         const selected = Array.isArray(preferredSelected) ? preferredSelected : collectDatasetIds();
         renderDatasetOptions(datasets, selected);
-        if (data.warning) {
+        if (data.source === "cache-miss") {
+          datasetMeta.textContent = `未找到缓存 | ${region}/${universe || "-"} D${delay} | 请点击“刷新数据集”手动下载`;
+        } else if (data.warning) {
           datasetMeta.textContent = `数据集 ${datasets.length} 条 | 来源 ${data.source || "-"} | ${region}/${universe || "-"} D${delay} | 警告: ${data.warning}`;
         } else {
           datasetMeta.textContent = `数据集 ${datasets.length} 条 | 来源 ${data.source || "-"} | ${region}/${universe || "-"} D${delay}`;
@@ -1844,6 +1846,15 @@ class FlowController:
                     "cache_file": str(cache_path),
                     "datasets": cached,
                 }
+            return {
+                "region": region,
+                "universe": universe,
+                "delay": delay,
+                "source": "cache-miss",
+                "cache_file": str(cache_path),
+                "warning": "cache not found; click refresh to fetch datasets",
+                "datasets": [],
+            }
 
         cfg = self._read_config()
         user, pwd = services.resolve_credentials(
