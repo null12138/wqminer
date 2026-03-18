@@ -38,6 +38,15 @@
   "template_style_items": 18,
   "template_seed_count": 16,
   "dataset_ids": [],
+  "dataset_presets": [
+    { "name": "USA · TOP3000 · D1", "region": "USA", "universe": "TOP3000", "delay": 1 },
+    { "name": "GLB · TOP3000 · D1", "region": "GLB", "universe": "TOP3000", "delay": 1 },
+    { "name": "EUR · TOP2500 · D1", "region": "EUR", "universe": "TOP2500", "delay": 1 },
+    { "name": "ASI · MINVOL1M · D1", "region": "ASI", "universe": "MINVOL1M", "delay": 1 },
+    { "name": "JPN · TOP3000 · D1", "region": "JPN", "universe": "TOP3000", "delay": 1 },
+    { "name": "CHN · TOP2000U · D1", "region": "CHN", "universe": "TOP2000U", "delay": 1 },
+    { "name": "IND · TOP500 · D1", "region": "IND", "universe": "TOP500", "delay": 1 }
+  ],
   "dataset_field_max_pages": 5,
   "dataset_field_page_limit": 50,
   "baseline_alpha_id": "",

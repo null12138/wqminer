@@ -383,6 +383,8 @@ HTML_PAGE = """<!doctype html>
         </div>
       </div>
       <div class="dataset-actions">
+        <select id="cfg-preset"></select>
+        <button id="cfg-apply-preset" class="secondary">应用预设</button>
         <button id="cfg-save" class="secondary">保存配置</button>
         <button id="ds-load" class="secondary">读缓存数据集</button>
         <button id="ds-refresh">刷新数据集</button>
@@ -491,6 +493,8 @@ HTML_PAGE = """<!doctype html>
     const cfgRegion = document.getElementById("cfg-region");
     const cfgUniverse = document.getElementById("cfg-universe");
     const cfgDelay = document.getElementById("cfg-delay");
+    const cfgPreset = document.getElementById("cfg-preset");
+    const cfgApplyPresetBtn = document.getElementById("cfg-apply-preset");
     const cfgDatasets = document.getElementById("cfg-datasets");
     const cfgSaveBtn = document.getElementById("cfg-save");
     const dsLoadBtn = document.getElementById("ds-load");
@@ -518,6 +522,7 @@ HTML_PAGE = """<!doctype html>
     let logCollapsed = false;
     let loadedDatasetOptions = [];
     let defaultUniverseMap = {};
+    let datasetPresets = [];
 
     function on(el, event, handler) {
       if (el && typeof el.addEventListener === "function") {
@@ -606,6 +611,63 @@ HTML_PAGE = """<!doctype html>
       });
       if (current) cfgRegion.value = String(current).toUpperCase();
       if (!cfgRegion.value && cfgRegion.options.length) cfgRegion.selectedIndex = 0;
+    }
+
+    function presetValueOf(item) {
+      if (!item) return "";
+      const region = String(item.region || "").toUpperCase();
+      const universe = String(item.universe || "").trim();
+      const delay = parseInt(String(item.delay || "1"), 10);
+      return [region, universe, isFinite(delay) ? delay : 1].join("|");
+    }
+
+    function findPresetByValue(value) {
+      const key = String(value || "");
+      return datasetPresets.find((item) => presetValueOf(item) === key) || null;
+    }
+
+    function findMatchingPreset(region, universe, delay) {
+      const r = String(region || "").toUpperCase();
+      const u = String(universe || "").trim();
+      const d = parseInt(String(delay || "1"), 10);
+      return datasetPresets.find((item) => {
+        return String(item.region || "").toUpperCase() === r
+          && String(item.universe || "").trim() === u
+          && parseInt(String(item.delay || "1"), 10) === d;
+      }) || null;
+    }
+
+    function populatePresetOptions(presets, currentRegion, currentUniverse, currentDelay) {
+      if (!cfgPreset) return;
+      datasetPresets = Array.isArray(presets) ? presets : [];
+      cfgPreset.innerHTML = "";
+      datasetPresets.forEach((item) => {
+        const opt = document.createElement("option");
+        opt.value = presetValueOf(item);
+        opt.textContent = String(item.name || `${item.region} · ${item.universe} · D${item.delay || 1}`);
+        cfgPreset.appendChild(opt);
+      });
+      const matched = findMatchingPreset(currentRegion, currentUniverse, currentDelay);
+      if (matched) {
+        cfgPreset.value = presetValueOf(matched);
+      } else if (cfgPreset.options.length) {
+        cfgPreset.selectedIndex = 0;
+      }
+    }
+
+    async function applySelectedPreset() {
+      if (!cfgPreset) return;
+      const selected = findPresetByValue(cfgPreset.value);
+      if (!selected) return;
+      cfgRegion.value = String(selected.region || "USA").toUpperCase();
+      cfgUniverse.value = String(selected.universe || "").trim();
+      const presetDelay = parseInt(String(selected.delay || "1"), 10);
+      cfgDelay.value = String(isFinite(presetDelay) ? presetDelay : 1);
+      setConfigState(`已应用预设: ${selected.name || cfgPreset.value}`);
+      setSelectedDatasetIds([]);
+      await saveConfig({ silent: true });
+      await loadDatasets(false, []);
+      note("预设已应用，可点击“刷新数据集”手动下载");
     }
 
     function normalizeDatasetRows(datasets) {
@@ -701,6 +763,12 @@ HTML_PAGE = """<!doctype html>
         const cfg = data.config || {};
         cfgUniverse.value = cfg.universe || cfgUniverse.value;
         cfgDelay.value = String(cfg.delay != null ? cfg.delay : cfgDelay.value || "1");
+        if (cfg.dataset_presets) {
+          populatePresetOptions(cfg.dataset_presets, cfg.region || cfgRegion.value, cfg.universe || cfgUniverse.value, cfg.delay != null ? cfg.delay : cfgDelay.value);
+        } else {
+          const matched = findMatchingPreset(cfgRegion.value, cfgUniverse.value, cfgDelay.value);
+          if (matched && cfgPreset) cfgPreset.value = presetValueOf(matched);
+        }
         setSelectedDatasetIds(cfg.dataset_ids || payload.dataset_ids || []);
         if (!silent) {
           setConfigState("配置已保存");
@@ -726,6 +794,7 @@ HTML_PAGE = """<!doctype html>
         populateRegionOptions(cfg.supported_regions || [], cfg.region || "USA");
         cfgUniverse.value = cfg.universe || "";
         cfgDelay.value = String(cfg.delay != null ? cfg.delay : 1);
+        populatePresetOptions(cfg.dataset_presets || [], cfg.region || "USA", cfg.universe || "", cfg.delay != null ? cfg.delay : 1);
         setManualDatasetIds(cfg.dataset_ids || []);
         setConfigState("配置已加载");
         const dsData = await loadDatasets(false, cfg.dataset_ids || []);
@@ -1074,6 +1143,13 @@ HTML_PAGE = """<!doctype html>
       if (!configPanel) return;
       configPanel.scrollIntoView({ behavior: "smooth", block: "start" });
     });
+    on(cfgApplyPresetBtn, "click", async () => {
+      try {
+        await applySelectedPreset();
+      } catch (err) {
+        setConfigState(`应用预设失败: ${err}`);
+      }
+    });
     on(exportBtn, "click", exportData);
     on(cfgSaveBtn, "click", async () => {
       try {
@@ -1124,11 +1200,15 @@ HTML_PAGE = """<!doctype html>
         const fallback = defaultUniverseMap[cfgRegion.value] || "";
         if (fallback) cfgUniverse.value = fallback;
       }
+      const matched = findMatchingPreset(cfgRegion.value, cfgUniverse.value, cfgDelay.value);
+      if (matched && cfgPreset) cfgPreset.value = presetValueOf(matched);
       try {
         await loadDatasets(false);
       } catch (err) {}
     });
     on(cfgDelay, "change", async () => {
+      const matched = findMatchingPreset(cfgRegion.value, cfgUniverse.value, cfgDelay.value);
+      if (matched && cfgPreset) cfgPreset.value = presetValueOf(matched);
       try {
         await loadDatasets(false);
       } catch (err) {}
@@ -1324,6 +1404,15 @@ SUPPORTED_REGIONS: List[str] = sorted(
     }
 )
 DEFAULT_DATASET_CATEGORIES: Sequence[str] = ("fundamental", "analyst", "model", "news", "alternative")
+DEFAULT_DATASET_PRESETS: Sequence[Dict[str, Any]] = (
+    {"name": "USA · TOP3000 · D1", "region": "USA", "universe": "TOP3000", "delay": 1},
+    {"name": "GLB · TOP3000 · D1", "region": "GLB", "universe": "TOP3000", "delay": 1},
+    {"name": "EUR · TOP2500 · D1", "region": "EUR", "universe": "TOP2500", "delay": 1},
+    {"name": "ASI · MINVOL1M · D1", "region": "ASI", "universe": "MINVOL1M", "delay": 1},
+    {"name": "JPN · TOP3000 · D1", "region": "JPN", "universe": "TOP3000", "delay": 1},
+    {"name": "CHN · TOP2000U · D1", "region": "CHN", "universe": "TOP2000U", "delay": 1},
+    {"name": "IND · TOP500 · D1", "region": "IND", "universe": "TOP500", "delay": 1},
+)
 
 
 def _safe_slug(value: str) -> str:
@@ -1347,6 +1436,47 @@ def _normalize_dataset_ids(value: Any) -> List[str]:
             continue
         seen.add(item)
         out.append(item)
+    return out
+
+
+def _normalize_dataset_preset(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    region = str(raw.get("region", "") or "").strip().upper()
+    if not region:
+        return None
+    universe = str(raw.get("universe", "") or "").strip() or get_default_universe(region)
+    delay = _parse_int(str(raw.get("delay", 1)), 1)
+    delay = max(0, delay)
+    name = str(raw.get("name", "") or "").strip()
+    if not name:
+        name = f"{region} · {universe} · D{delay}"
+    return {
+        "name": name,
+        "region": region,
+        "universe": universe,
+        "delay": delay,
+    }
+
+
+def _normalize_dataset_presets(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, (list, tuple)):
+        source = list(value)
+    else:
+        source = list(DEFAULT_DATASET_PRESETS)
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for raw in source:
+        normalized = _normalize_dataset_preset(raw)
+        if not normalized:
+            continue
+        key = (normalized["region"], normalized["universe"], normalized["delay"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(normalized)
+    if not out:
+        return [dict(x) for x in DEFAULT_DATASET_PRESETS]
     return out
 
 
@@ -1642,11 +1772,13 @@ class FlowController:
         universe = str(_get(cfg, "universe", get_default_universe(region)))
         delay = int(_get(cfg, "delay", 1))
         dataset_ids = _normalize_dataset_ids(_get(cfg, "dataset_ids", []))
+        dataset_presets = _normalize_dataset_presets(_get(cfg, "dataset_presets", list(DEFAULT_DATASET_PRESETS)))
         return {
             "region": region,
             "universe": universe,
             "delay": delay,
             "dataset_ids": dataset_ids,
+            "dataset_presets": dataset_presets,
             "config_path": self.config_path,
             "results_dir": self.results_dir,
             "library_path": self.library_path,
@@ -1667,11 +1799,13 @@ class FlowController:
             delay = _parse_int(str(payload.get("delay", _get(cfg, "delay", 1))), int(_get(cfg, "delay", 1)))
             delay = max(0, delay)
             dataset_ids = _normalize_dataset_ids(payload.get("dataset_ids", _get(cfg, "dataset_ids", [])))
+            dataset_presets = _normalize_dataset_presets(payload.get("dataset_presets", _get(cfg, "dataset_presets", list(DEFAULT_DATASET_PRESETS))))
 
             cfg["region"] = region
             cfg["universe"] = universe
             cfg["delay"] = delay
             cfg["dataset_ids"] = dataset_ids
+            cfg["dataset_presets"] = dataset_presets
 
             self._write_config(cfg)
             self._apply_paths_from_config(cfg)
@@ -1681,6 +1815,7 @@ class FlowController:
             "universe": universe,
             "delay": delay,
             "dataset_ids": dataset_ids,
+            "dataset_presets": dataset_presets,
             "supported_regions": SUPPORTED_REGIONS,
             "default_universe_map": dict(DEFAULT_UNIVERSE),
         }
