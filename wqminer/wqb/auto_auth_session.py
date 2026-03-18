@@ -100,6 +100,9 @@ class AutoAuthSession(Session):
             )
         if log is not None:
             self.logger.info(f"{self}.auth_request(...) [{tries} tries]: {log}")
+        token = resp.headers.get("X-WQB-Session-Token")
+        if token:
+            self.headers.update({"X-WQB-Session-Token": token})
         return resp
 
     def request(

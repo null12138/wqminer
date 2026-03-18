@@ -89,14 +89,33 @@ class WorldQuantBrainClient:
         self.authenticate()
 
     def authenticate(self, max_retries: int = 5) -> None:
+        self.authenticate_with_mode(max_retries=max_retries, force=False)
+
+    def authenticate_with_mode(
+        self,
+        max_retries: int = 5,
+        *,
+        force: bool = False,
+        stale_token: Optional[str] = None,
+    ) -> None:
         max_retries = max(1, int(max_retries))
-        if self._has_auth_token():
+        if not force and self._has_auth_token():
             return
         last_response: Optional[requests.Response] = None
         cls = self.__class__
         with cls._auth_lock:
             self._sync_shared_auth()
-            if self._has_auth_token():
+            if force:
+                current_token = (self.sess.headers.get("X-WQB-Session-Token") or "").strip()
+                if stale_token and current_token and current_token != stale_token:
+                    # Another worker likely refreshed token while we were waiting for the lock.
+                    return
+                self.sess.headers.pop("X-WQB-Session-Token", None)
+                try:
+                    self.sess.cookies.clear()
+                except Exception:
+                    pass
+            elif self._has_auth_token():
                 return
             now = time.monotonic()
             if cls._auth_cooldown_until > now:
@@ -184,7 +203,8 @@ class WorldQuantBrainClient:
 
             if response.status_code == 401 and retry_auth and attempt < max_retries:
                 logger.warning("401 received on %s %s, re-authenticating and retrying", method, url)
-                self.authenticate()
+                stale_token = (self.sess.headers.get("X-WQB-Session-Token") or "").strip()
+                self.authenticate_with_mode(force=True, stale_token=stale_token)
                 continue
 
             if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
