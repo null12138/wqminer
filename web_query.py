@@ -338,6 +338,7 @@ HTML_PAGE = """<!doctype html>
           <p>控制主流程 + 查询历史结果 + 标注/导出。</p>
         </div>
         <div class="actions">
+          <button id="goto-config" class="secondary">运行配置</button>
           <button id="start">启动主流程</button>
           <button id="stop" class="danger">停止主流程</button>
           <span id="status" class="status-pill">状态: unknown</span>
@@ -359,7 +360,7 @@ HTML_PAGE = """<!doctype html>
       </div>
     </div>
 
-    <div class="panel">
+    <div class="panel" id="config-panel">
       <div class="panel-title">
         <h3>运行配置（区域/数据集）</h3>
         <span class="muted" id="config-state">读取中...</span>
@@ -472,6 +473,7 @@ HTML_PAGE = """<!doctype html>
     const runBtn = document.getElementById("run");
     const startBtn = document.getElementById("start");
     const stopBtn = document.getElementById("stop");
+    const gotoConfigBtn = document.getElementById("goto-config");
     const statusEl = document.getElementById("status");
     const statusText = document.getElementById("status-text");
     const metaEl = document.getElementById("meta");
@@ -499,6 +501,7 @@ HTML_PAGE = """<!doctype html>
     const cfgState = document.getElementById("config-state");
     const datasetMeta = document.getElementById("dataset-meta");
     const cfgDatasetsManual = document.getElementById("cfg-datasets-manual");
+    const configPanel = document.getElementById("config-panel");
 
     const COLOR_OPTIONS = [
       { label: "无", value: "" },
@@ -1057,6 +1060,10 @@ HTML_PAGE = """<!doctype html>
       fetchLog();
     });
     runBtn.addEventListener("click", runQuery);
+    gotoConfigBtn.addEventListener("click", () => {
+      if (!configPanel) return;
+      configPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
     exportBtn.addEventListener("click", exportData);
     cfgSaveBtn.addEventListener("click", async () => {
       try {
@@ -1861,10 +1868,16 @@ LOG_BUFFER: Optional[LogBufferHandler] = None
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _send_no_cache(self) -> None:
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+
     def _send_json(self, payload: Dict, status: int = 200) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self._send_no_cache()
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1878,6 +1891,7 @@ class Handler(BaseHTTPRequestHandler):
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
+        self._send_no_cache()
         if filename:
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(data)))
@@ -1890,6 +1904,7 @@ class Handler(BaseHTTPRequestHandler):
             body = HTML_PAGE.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self._send_no_cache()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
