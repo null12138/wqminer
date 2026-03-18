@@ -519,12 +519,19 @@ HTML_PAGE = """<!doctype html>
     let loadedDatasetOptions = [];
     let defaultUniverseMap = {};
 
+    function on(el, event, handler) {
+      if (el && typeof el.addEventListener === "function") {
+        el.addEventListener(event, handler);
+      }
+    }
+
     function formatNumber(value, digits) {
       if (typeof value !== "number" || !isFinite(value)) return "--";
       return value.toFixed(digits);
     }
 
     function note(msg) {
+      if (!saveState) return;
       saveState.textContent = msg;
       if (clearTimer) clearTimeout(clearTimer);
       clearTimer = setTimeout(() => {
@@ -533,6 +540,7 @@ HTML_PAGE = """<!doctype html>
     }
 
     function setConfigState(msg) {
+      if (!cfgState) return;
       cfgState.textContent = msg || "";
     }
 
@@ -551,6 +559,7 @@ HTML_PAGE = """<!doctype html>
     }
 
     function selectedDatasetIds() {
+      if (!cfgDatasets) return [];
       return Array.from(cfgDatasets.selectedOptions || []).map((opt) => String(opt.value || "").trim()).filter(Boolean);
     }
 
@@ -618,6 +627,7 @@ HTML_PAGE = """<!doctype html>
     }
 
     function renderDatasetOptions(datasets, selectedIds) {
+      if (!cfgDatasets) return;
       const selected = splitDatasetIds(selectedIds && selectedIds.length ? selectedIds : collectDatasetIds());
       const selectedSet = new Set(selected);
       const filter = String(dsSearch && dsSearch.value ? dsSearch.value : "").trim().toLowerCase();
@@ -1059,55 +1069,57 @@ HTML_PAGE = """<!doctype html>
       fetchProgress();
       fetchLog();
     });
-    runBtn.addEventListener("click", runQuery);
-    gotoConfigBtn.addEventListener("click", () => {
+    on(runBtn, "click", runQuery);
+    on(gotoConfigBtn, "click", () => {
       if (!configPanel) return;
       configPanel.scrollIntoView({ behavior: "smooth", block: "start" });
     });
-    exportBtn.addEventListener("click", exportData);
-    cfgSaveBtn.addEventListener("click", async () => {
+    on(exportBtn, "click", exportData);
+    on(cfgSaveBtn, "click", async () => {
       try {
         await saveConfig();
       } catch (err) {}
     });
-    dsLoadBtn.addEventListener("click", async () => {
+    on(dsLoadBtn, "click", async () => {
       try {
         await loadDatasets(false);
       } catch (err) {}
     });
-    dsRefreshBtn.addEventListener("click", async () => {
+    on(dsRefreshBtn, "click", async () => {
       try {
         await loadDatasets(true);
       } catch (err) {}
     });
-    cfgDatasets.addEventListener("mousedown", (event) => {
+    on(cfgDatasets, "mousedown", (event) => {
       const target = event.target;
       if (!target || target.tagName !== "OPTION" || target.disabled) return;
       event.preventDefault();
       target.selected = !target.selected;
     });
-    dsSearch.addEventListener("input", () => {
+    on(dsSearch, "input", () => {
       renderDatasetOptions(loadedDatasetOptions, collectDatasetIds());
     });
-    dsSelectAllBtn.addEventListener("click", () => {
+    on(dsSelectAllBtn, "click", () => {
+      if (!cfgDatasets) return;
       Array.from(cfgDatasets.options || []).forEach((opt) => {
         if (opt.disabled || !opt.value) return;
         opt.selected = true;
       });
     });
-    dsClearBtn.addEventListener("click", () => {
+    on(dsClearBtn, "click", () => {
+      if (!cfgDatasets) return;
       Array.from(cfgDatasets.options || []).forEach((opt) => {
         opt.selected = false;
       });
       setManualDatasetIds([]);
       note("已清空 dataset 选择");
     });
-    cfgDatasetsManual.addEventListener("blur", () => {
+    on(cfgDatasetsManual, "blur", () => {
       const manual = manualDatasetIds();
       const selected = selectedDatasetIds();
       renderDatasetOptions(loadedDatasetOptions, [...selected, ...manual]);
     });
-    cfgRegion.addEventListener("change", async () => {
+    on(cfgRegion, "change", async () => {
       if (!cfgUniverse.value.trim()) {
         const fallback = defaultUniverseMap[cfgRegion.value] || "";
         if (fallback) cfgUniverse.value = fallback;
@@ -1116,23 +1128,29 @@ HTML_PAGE = """<!doctype html>
         await loadDatasets(false);
       } catch (err) {}
     });
-    cfgDelay.addEventListener("change", async () => {
+    on(cfgDelay, "change", async () => {
       try {
         await loadDatasets(false);
       } catch (err) {}
     });
-    cfgUniverse.addEventListener("keydown", (event) => {
+    on(cfgUniverse, "keydown", (event) => {
       if (event.key === "Enter") {
         event.preventDefault();
         loadDatasets(false).catch(() => {});
       }
     });
-    logToggle.addEventListener("click", () => {
+    on(logToggle, "click", () => {
       logEl.classList.toggle("collapsed");
       logCollapsed = logEl.classList.contains("collapsed");
       if (!logCollapsed) {
         fetchLog();
       }
+    });
+
+    window.addEventListener("error", (event) => {
+      const msg = event && event.message ? String(event.message) : "unknown frontend error";
+      setConfigState(`前端异常: ${msg}`);
+      if (datasetMeta) datasetMeta.textContent = `前端异常: ${msg}`;
     });
 
     loadConfig();
