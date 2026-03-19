@@ -11,10 +11,12 @@ import re
 import socket
 import threading
 import time
+import zipfile
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -69,6 +71,134 @@ def _normalize_guide_paths(value: Optional[Sequence[str] | str]) -> List[str]:
     return out
 
 
+def _read_text_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def _read_text_from_zip(zip_path: Path, member: str) -> str:
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            with zf.open(member) as handle:
+                return handle.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _summarize_ai_worker_guidance(raw: str, *, max_chars: int = 1100) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    keywords = (
+        "stable pnl",
+        "economic sense",
+        "simulation settings",
+        "region",
+        "delay",
+        "universe",
+        "neutralization",
+        "winsorize",
+        "zscore",
+        "normalize",
+        "group_neutralize",
+        "regression_neut",
+        "turnover",
+        "correlation",
+        "pitfall",
+        "alpha",
+        "pyramid",
+    )
+
+    picked: List[str] = []
+    seen = set()
+    for line in lines:
+        norm = line.lstrip("-* ").strip()
+        if not norm:
+            continue
+        low = norm.lower()
+        if not any(k in low for k in keywords):
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        picked.append(f"- {norm}")
+        if len(picked) >= 10:
+            break
+
+    if not picked:
+        for line in lines[:8]:
+            norm = line.lstrip("-* ").strip()
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            picked.append(f"- {norm}")
+
+    out = "\n".join(picked).strip()
+    if not out:
+        return ""
+    if len(out) > max_chars:
+        return out[:max_chars].rstrip()
+    return out
+
+
+@lru_cache(maxsize=8)
+def _load_ai_worker_guidance(source_path: str) -> str:
+    source = (source_path or "").strip()
+    if not source:
+        return ""
+    path = Path(source).expanduser()
+    if not path.exists():
+        return ""
+
+    raw = ""
+    if path.is_file() and path.suffix.lower() == ".zip":
+        try:
+            with zipfile.ZipFile(path) as zf:
+                names = zf.namelist()
+        except Exception:
+            names = []
+        target = ""
+        for name in names:
+            low = name.lower()
+            if low.endswith("brain-consultant.md"):
+                target = name
+                break
+        if not target:
+            for name in names:
+                low = name.lower()
+                if low.endswith(".md") and ("consultant" in low or "brain" in low or "ai" in low):
+                    target = name
+                    break
+        if target:
+            raw = _read_text_from_zip(path, target)
+    elif path.is_file():
+        raw = _read_text_file(path)
+
+    return _summarize_ai_worker_guidance(raw)
+
+
+def _compose_generation_style(
+    *,
+    style_prompt: str,
+    inspiration: str,
+    ai_worker_guidance: str,
+) -> str:
+    chunks: List[str] = []
+    base = (style_prompt or "").strip()
+    if base:
+        chunks.append(base)
+    idea = (inspiration or "").strip()
+    if idea:
+        chunks.append(f"Inspiration:\n{idea}")
+    worker = (ai_worker_guidance or "").strip()
+    if worker:
+        chunks.append("AI Worker Guidance:\n" + worker)
+    return "\n\n".join(chunks).strip()
+
+
 def default_fields_cache_path(
     region: str,
     universe: str,
@@ -105,7 +235,6 @@ class SupabaseQueueClient:
         base_url: str,
         service_key: str,
         timeout_sec: int = 20,
-        batch_table: str = "alpha_batches",
         job_table: str = "alpha_jobs",
     ) -> None:
         base = str(base_url or "").strip().rstrip("/")
@@ -117,7 +246,6 @@ class SupabaseQueueClient:
         self.base_url = base
         self.service_key = key
         self.timeout_sec = max(3, int(timeout_sec))
-        self.batch_table = str(batch_table or "alpha_batches").strip()
         self.job_table = str(job_table or "alpha_jobs").strip()
 
     def _headers(self, prefer: str = "return=representation") -> Dict[str, str]:
@@ -139,12 +267,6 @@ class SupabaseQueueClient:
             raise RuntimeError(f"Supabase insert failed ({resp.status_code}) table={table}: {resp.text}")
         payload = resp.json()
         return payload if isinstance(payload, list) else []
-
-    def create_batch(self, payload: Dict[str, object]) -> Dict[str, object]:
-        rows = self._post_rows(self.batch_table, [payload])
-        if not rows:
-            raise RuntimeError("Supabase create_batch returned empty result")
-        return dict(rows[0])
 
     def enqueue_jobs(self, jobs: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
         return self._post_rows(self.job_table, jobs)
@@ -425,14 +547,14 @@ def produce_templates_only(
     template_style_items: int = 0,
     template_seed_count: int = 0,
     seed_templates: str = "",
+    generate_inspiration: bool = False,
+    ai_worker_file: str = "wqminer/constants/worker_prompt_compact.md",
+    max_generate_attempts: int = 4,
     dataset_ids: Optional[Sequence[str] | str] = None,
     dataset_field_max_pages: int = 5,
     dataset_field_page_limit: int = 50,
     output_dir: str = "results/producer",
     enqueue: bool = False,
-    queue_priority: int = 0,
-    queue_max_attempts: int = 6,
-    queue_batch_table: str = "alpha_batches",
     queue_job_table: str = "alpha_jobs",
     supabase_url: str = "",
     supabase_service_key: str = "",
@@ -473,7 +595,7 @@ def produce_templates_only(
             fields = client.load_fallback_default_fields()
         save_data_fields_cache(fields_cache, fields)
 
-    if not inspiration:
+    if not inspiration and bool(generate_inspiration):
         seed_exprs = _load_seed_expressions(seed_templates)
         inspiration = generate_inspiration_text(
             llm_config_path=llm_config_path,
@@ -483,6 +605,9 @@ def produce_templates_only(
             style_seed=style_prompt,
             seed_expressions=seed_exprs,
         )
+    ai_worker_guidance = _load_ai_worker_guidance(ai_worker_file)
+    if ai_worker_guidance:
+        logging.info("Loaded AI worker guidance from %s", ai_worker_file)
 
     operators = load_operators(operator_file)
     llm = OpenAICompatibleLLM(load_llm_config(llm_config_path))
@@ -496,7 +621,11 @@ def produce_templates_only(
         )
     elif template_guide_path:
         logging.info("Template guide not found or empty: %s", template_guide_path)
-    style = merge_style_prompt(style_prompt, inspiration)
+    style = _compose_generation_style(
+        style_prompt=style_prompt,
+        inspiration=inspiration,
+        ai_worker_guidance=ai_worker_guidance,
+    )
     target_count = int(batch_size) if int(batch_size) > 0 else int(template_count)
 
     expressions, preflight_reports = _prepare_candidate_batch(
@@ -517,6 +646,8 @@ def produce_templates_only(
         template_lines=template_lines,
         template_style_items=int(template_style_items),
         template_seed_count=int(template_seed_count),
+        policy_prompt=ai_worker_guidance,
+        max_generate_attempts=max(1, int(max_generate_attempts)),
     )
 
     settings_payload = _build_job_settings(
@@ -540,8 +671,6 @@ def produce_templates_only(
                 "neutralization": neutralization,
                 "language": str(settings_payload.get("language", "FASTEXPR")),
                 "status": "queued",
-                "priority": int(queue_priority),
-                "max_attempts": max(1, int(queue_max_attempts)),
                 "source": "local_producer",
                 "source_host": host,
                 "meta": {
@@ -569,35 +698,13 @@ def produce_templates_only(
     }
     output_file.write_text(json.dumps(local_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    queue_batch_id = ""
     enqueued_count = 0
     if enqueue:
         queue = SupabaseQueueClient(
             base_url=supabase_url,
             service_key=supabase_service_key,
-            batch_table=queue_batch_table,
             job_table=queue_job_table,
         )
-        batch = queue.create_batch(
-            {
-                "region": region,
-                "universe": universe,
-                "delay": delay,
-                "neutralization": neutralization,
-                "language": str(settings_payload.get("language", "FASTEXPR")),
-                "template_count": len(expressions),
-                "producer_host": host,
-                "metadata": {
-                    "output_file": str(output_file),
-                    "fields_cache": fields_cache,
-                    "dataset_ids": selected_dataset_ids,
-                },
-            }
-        )
-        queue_batch_id = str(batch.get("id", "")).strip()
-        if queue_batch_id:
-            for item in jobs_payload:
-                item["batch_id"] = queue_batch_id
         inserted = queue.enqueue_jobs(jobs_payload)
         enqueued_count = len(inserted)
 
@@ -605,7 +712,6 @@ def produce_templates_only(
         "output_file": str(output_file),
         "count": len(expressions),
         "enqueued_count": enqueued_count,
-        "queue_batch_id": queue_batch_id,
         "fields_cache": fields_cache,
         "dataset_ids": selected_dataset_ids,
         "preflight_reports": preflight_reports,
@@ -730,12 +836,14 @@ def _generate_expressions(
     fields: Sequence[DataField],
     count: int,
     style_prompt: str,
+    policy_prompt: str = "",
 ) -> List[str]:
     templates = generator.generate_templates(
         region=region,
         data_fields=list(fields),
         count=max(1, int(count)),
         style_prompt=style_prompt,
+        policy_prompt=policy_prompt,
     )
     expressions = [t.expression for t in templates if t and t.expression]
     return _unique_expressions(expressions)
@@ -1111,6 +1219,17 @@ def _instantiate_template_line(line: str, *, operators: set, pools: Dict[str, Li
     return text
 
 
+def _template_line_compatible(line: str, *, operators: set) -> bool:
+    text = _normalize_template_line(line)
+    if not text:
+        return False
+    fn_names = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text)
+    for fn in fn_names:
+        if fn not in operators:
+            return False
+    return True
+
+
 def _render_template_seed_expressions(
     template_lines: Sequence[str],
     *,
@@ -1122,7 +1241,13 @@ def _render_template_seed_expressions(
         return []
     operator_names = {str(op.get("name", "")).strip() for op in operators if op.get("name")}
     pools = _field_pools_for_templates(fields)
-    picks = random.sample(list(template_lines), min(len(template_lines), max(count * 3, count)))
+    compatible_lines = [
+        line
+        for line in template_lines
+        if _template_line_compatible(line, operators=operator_names)
+    ]
+    source_lines = compatible_lines if compatible_lines else list(template_lines)
+    picks = random.sample(source_lines, min(len(source_lines), max(count * 3, count)))
     out: List[str] = []
     seen = set()
     for line in picks:
@@ -1322,7 +1447,8 @@ def _prepare_candidate_batch(
     template_lines: Optional[Sequence[str]] = None,
     template_style_items: int = 0,
     template_seed_count: int = 0,
-    max_generate_attempts: int = 8,
+    policy_prompt: str = "",
+    max_generate_attempts: int = 4,
 ) -> Tuple[List[str], Dict[str, Dict]]:
     target = max(1, int(count))
     pool: List[str] = []
@@ -1361,6 +1487,18 @@ def _prepare_candidate_batch(
             add_candidate(expr)
         if seed_exprs:
             logging.info("Template seed candidates added: %s", len(seed_exprs))
+        selected, violations = _select_batch_from_pool(
+            pool,
+            reports,
+            target_count=target,
+            enforce_exact_batch=enforce_exact_batch,
+            required_theme_coverage=required_theme_coverage,
+            common_operator_limit=common_operator_limit,
+            enforce_explore_theme_pairs=enforce_explore_theme_pairs,
+        )
+        if selected:
+            return selected, {expr: reports.get(expr, {}) for expr in selected}
+        last_violations = violations
 
     for attempt in range(1, max(1, int(max_generate_attempts)) + 1):
         needed = max(1, target - len(pool))
@@ -1373,7 +1511,14 @@ def _prepare_candidate_batch(
             )
             if snippet:
                 attempt_style = merge_style_prompt(style_prompt, snippet)
-        generated = _generate_expressions(generator, region, fields, request_count, attempt_style)
+        generated = _generate_expressions(
+            generator,
+            region,
+            fields,
+            request_count,
+            attempt_style,
+            policy_prompt=policy_prompt,
+        )
 
         for expr in generated:
             add_candidate(expr)
@@ -1871,6 +2016,9 @@ def run_one_click(
     template_guide_path: Optional[Sequence[str] | str] = "",
     template_style_items: int = 0,
     template_seed_count: int = 0,
+    generate_inspiration: bool = False,
+    ai_worker_file: str = "wqminer/constants/worker_prompt_compact.md",
+    max_generate_attempts: int = 4,
     dataset_ids: Optional[Sequence[str] | str] = None,
     dataset_field_max_pages: int = 5,
     dataset_field_page_limit: int = 50,
@@ -1941,8 +2089,8 @@ def run_one_click(
             fields = client.load_fallback_default_fields()
         save_data_fields_cache(fields_cache, fields)
 
-    seed_exprs = _load_seed_expressions(seed_templates)
-    if not inspiration:
+    if not inspiration and bool(generate_inspiration):
+        seed_exprs = _load_seed_expressions(seed_templates)
         inspiration = generate_inspiration_text(
             llm_config_path=llm_config_path,
             region=region,
@@ -1951,6 +2099,9 @@ def run_one_click(
             style_seed=style_prompt,
             seed_expressions=seed_exprs,
         )
+    ai_worker_guidance = _load_ai_worker_guidance(ai_worker_file)
+    if ai_worker_guidance:
+        logging.info("Loaded AI worker guidance from %s", ai_worker_file)
 
     operators = load_operators(operator_file)
     llm = OpenAICompatibleLLM(load_llm_config(llm_config_path))
@@ -1965,7 +2116,11 @@ def run_one_click(
     elif template_guide_path:
         logging.info("Template guide not found or empty: %s", template_guide_path)
 
-    base_style = merge_style_prompt(style_prompt, inspiration)
+    base_style = _compose_generation_style(
+        style_prompt=style_prompt,
+        inspiration=inspiration,
+        ai_worker_guidance=ai_worker_guidance,
+    )
     ts = time.strftime("%Y%m%d_%H%M%S")
     out_root = Path(output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -2036,6 +2191,8 @@ def run_one_click(
                 template_lines=template_lines,
                 template_style_items=int(template_style_items),
                 template_seed_count=int(template_seed_count),
+                policy_prompt=ai_worker_guidance,
+                max_generate_attempts=max(1, int(max_generate_attempts)),
             )
             def row_cb(row: Dict[str, float]) -> None:
                 _maybe_notify_row(row, region, universe, delay, round_idx, notify_url, notified_seen)

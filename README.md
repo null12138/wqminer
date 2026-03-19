@@ -25,6 +25,12 @@ Then run:
 ```bash
 python3 run.py --config run_config.json
 ```
+Minimal high-throughput producer (local generate -> queue):
+```bash
+python3 run.py --mode produce --config run_config.json --count 64 --enqueue \
+  --supabase-url "$SUPABASE_URL" \
+  --supabase-service-key "$SUPABASE_SERVICE_ROLE_KEY"
+```
 
 ## Decoupled Architecture (Local Producer + Remote Rust Submitter)
 Goal:
@@ -58,15 +64,30 @@ cargo run --release
 ```
 Prebuilt artifact:
 - `bin/remote_submitter_arm64` (macOS arm64)
+- `bin/remote_submitter_linux_arm64` (Linux arm64, musl/static)
+
+For Raspberry Pi/Linux arm64, compile on the remote machine:
+```bash
+cd remote_submitter
+cargo build --release
+./target/release/remote_submitter
+```
 
 Detailed runtime knobs: `remote_submitter/README.md`.
 Remote submitter behavior:
-- claims `queued/retry` jobs with `FOR UPDATE SKIP LOCKED`
+- claims `queued` jobs with `FOR UPDATE SKIP LOCKED`
 - strictly processes from old to new (`created_at ASC`)
 - continuously refills worker slots (no batch barrier)
 - runs high concurrency simulation/submit
 - writes status + metrics back to `alpha_jobs`
 - local producer changes do not impact running remote submitter binary
+
+## Fast Workflow (Simplified)
+The generation path is now optimized for throughput:
+1. seed-first from guide templates (`temp.md`, `dt`, or configured guide files)
+2. strict local preflight filtering
+3. LLM fallback only when seed pool is insufficient
+4. AI worker guidance injection from `ai_worker_file` (default: `wqminer/constants/worker_prompt_compact.md`)
 
 ## Key config knobs
 - `concurrency_profile`: parallel profile (`advisor`/`balanced`/`safe`/`custom`); default `advisor` auto-lifts legacy low concurrency
@@ -93,14 +114,21 @@ Strict preflight knobs (optional):
 - `template_guide_paths`: optional array form of multi-path guide config (higher priority than `template_guide_path`)
 - `template_style_items`: number of template lines injected into each generation prompt
 - `template_seed_count`: number of placeholder-rendered template seeds added before LLM generation
+- `generate_inspiration`: whether to run extra inspiration LLM call (default false for faster pipeline)
+- `ai_worker_file`: local `.md` guidance source (default `wqminer/constants/worker_prompt_compact.md`)
+- `max_generate_attempts`: LLM generation retry rounds per batch (default 4)
 - `dataset_ids`: optional selected dataset id list; when set, field cache/fetch only uses these datasets
 - `dataset_field_max_pages`: max field pages per selected dataset
 - `dataset_field_page_limit`: page size when pulling selected-dataset fields
 - `results_append_file`: append each round's core result rows to a text file
+- `runner_mode`: `oneclick` or `produce_enqueue` (WebUI/配置可切换)
 - `producer_output_dir`: local producer output directory
+- `producer_enqueue`: must be `true` for `produce_enqueue` mode
+- `producer_loop_batches`: producer loop rounds (`0` means infinite)
+- `producer_loop_sleep_sec`: sleep seconds between producer rounds
 - `supabase_url`: Supabase URL for queue enqueue
 - `supabase_service_role_key`: service-role key for producer enqueue
-- `queue_batch_table` / `queue_job_table`: queue table names
+- `queue_job_table`: queue table name (single-table queue)
 
 ## Auto-append to library
 Results with `sharpe >= 1.2` and `fitness >= 1.0` are appended to `templates/library.json` (deduped).
@@ -143,7 +171,7 @@ One process handles everything: start/stop the flow + query results.
 bash start_web.sh
 ```
 Then open `http://localhost:8002` in your browser.
-WebUI now supports selecting `region/universe/delay`, parallel profile + concurrency knobs (advisor/balanced/safe/custom), applying preset combos (USA/ASI/JPN etc.), loading dataset list from cache or live API, multi-selecting `dataset_ids`, fallback manual `dataset_ids` input when API fails, and persisting them into `run_config.json` before start.
+WebUI now supports selecting `region/universe/delay`, `runner_mode` (`oneclick`/`produce_enqueue`), producer loop controls, parallel profile + concurrency knobs (advisor/balanced/safe/custom), applying preset combos (USA/ASI/JPN etc.), loading dataset list from cache or live API, multi-selecting `dataset_ids`, fallback manual `dataset_ids` input when API fails, and persisting them into `run_config.json` before start.
 
 Optional overrides:
 ```bash

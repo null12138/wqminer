@@ -8,6 +8,7 @@ import csv
 import io
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -382,6 +383,13 @@ HTML_PAGE = """<!doctype html>
           </select>
         </div>
         <div class="config-item">
+          <label for="cfg-runner-mode">Runner Mode</label>
+          <select id="cfg-runner-mode">
+            <option value="oneclick">oneclick (本地回测)</option>
+            <option value="produce_enqueue">produce_enqueue (只生产并入队)</option>
+          </select>
+        </div>
+        <div class="config-item">
           <label for="cfg-concurrency-profile">Parallel Profile</label>
           <select id="cfg-concurrency-profile">
             <option value="advisor">advisor (50+)</option>
@@ -405,6 +413,14 @@ HTML_PAGE = """<!doctype html>
         <div class="config-item">
           <label for="cfg-poll-interval">Poll Interval(s)</label>
           <input id="cfg-poll-interval" type="number" min="1" step="1" placeholder="10" />
+        </div>
+        <div class="config-item">
+          <label for="cfg-producer-batches">Producer Batches</label>
+          <input id="cfg-producer-batches" type="number" min="0" step="1" placeholder="60 (0=无限)" />
+        </div>
+        <div class="config-item">
+          <label for="cfg-producer-sleep">Producer Sleep(s)</label>
+          <input id="cfg-producer-sleep" type="number" min="0" step="0.1" placeholder="1" />
         </div>
       </div>
       <div class="dataset-actions">
@@ -518,11 +534,14 @@ HTML_PAGE = """<!doctype html>
     const cfgRegion = document.getElementById("cfg-region");
     const cfgUniverse = document.getElementById("cfg-universe");
     const cfgDelay = document.getElementById("cfg-delay");
+    const cfgRunnerMode = document.getElementById("cfg-runner-mode");
     const cfgConcurrencyProfile = document.getElementById("cfg-concurrency-profile");
     const cfgConcurrency = document.getElementById("cfg-concurrency");
     const cfgConcurrencyCap = document.getElementById("cfg-concurrency-cap");
     const cfgTemplateCount = document.getElementById("cfg-template-count");
     const cfgPollInterval = document.getElementById("cfg-poll-interval");
+    const cfgProducerBatches = document.getElementById("cfg-producer-batches");
+    const cfgProducerSleep = document.getElementById("cfg-producer-sleep");
     const cfgPreset = document.getElementById("cfg-preset");
     const cfgApplyPresetBtn = document.getElementById("cfg-apply-preset");
     const cfgDatasets = document.getElementById("cfg-datasets");
@@ -778,12 +797,15 @@ HTML_PAGE = """<!doctype html>
         region: (cfgRegion.value || "").toUpperCase(),
         universe: (cfgUniverse.value || "").trim(),
         delay: parseInt(cfgDelay.value || "1", 10),
+        runner_mode: (cfgRunnerMode && cfgRunnerMode.value ? String(cfgRunnerMode.value).trim() : "oneclick") || "oneclick",
         dataset_ids: collectDatasetIds(),
         concurrency_profile: (cfgConcurrencyProfile && cfgConcurrencyProfile.value ? String(cfgConcurrencyProfile.value).trim() : "advisor") || "advisor",
         concurrency: parseInt(cfgConcurrency && cfgConcurrency.value ? cfgConcurrency.value : "56", 10),
         concurrency_cap: parseInt(cfgConcurrencyCap && cfgConcurrencyCap.value ? cfgConcurrencyCap.value : "0", 10),
         template_count: parseInt(cfgTemplateCount && cfgTemplateCount.value ? cfgTemplateCount.value : "64", 10),
-        poll_interval: parseInt(cfgPollInterval && cfgPollInterval.value ? cfgPollInterval.value : "10", 10)
+        poll_interval: parseInt(cfgPollInterval && cfgPollInterval.value ? cfgPollInterval.value : "10", 10),
+        producer_loop_batches: parseInt(cfgProducerBatches && cfgProducerBatches.value ? cfgProducerBatches.value : "60", 10),
+        producer_loop_sleep_sec: parseFloat(cfgProducerSleep && cfgProducerSleep.value ? cfgProducerSleep.value : "1")
       };
       try {
         const resp = await fetch("/api/config", {
@@ -798,11 +820,14 @@ HTML_PAGE = """<!doctype html>
         const cfg = data.config || {};
         cfgUniverse.value = cfg.universe || cfgUniverse.value;
         cfgDelay.value = String(cfg.delay != null ? cfg.delay : cfgDelay.value || "1");
+        if (cfgRunnerMode) cfgRunnerMode.value = String(cfg.runner_mode || "oneclick");
         if (cfgConcurrencyProfile) cfgConcurrencyProfile.value = String(cfg.concurrency_profile || "advisor");
         if (cfgConcurrency) cfgConcurrency.value = String(cfg.concurrency != null ? cfg.concurrency : (cfgConcurrency.value || "56"));
         if (cfgConcurrencyCap) cfgConcurrencyCap.value = String(cfg.concurrency_cap != null ? cfg.concurrency_cap : (cfgConcurrencyCap.value || "0"));
         if (cfgTemplateCount) cfgTemplateCount.value = String(cfg.template_count != null ? cfg.template_count : (cfgTemplateCount.value || "64"));
         if (cfgPollInterval) cfgPollInterval.value = String(cfg.poll_interval != null ? cfg.poll_interval : (cfgPollInterval.value || "10"));
+        if (cfgProducerBatches) cfgProducerBatches.value = String(cfg.producer_loop_batches != null ? cfg.producer_loop_batches : (cfgProducerBatches.value || "60"));
+        if (cfgProducerSleep) cfgProducerSleep.value = String(cfg.producer_loop_sleep_sec != null ? cfg.producer_loop_sleep_sec : (cfgProducerSleep.value || "1"));
         if (cfg.dataset_presets) {
           populatePresetOptions(cfg.dataset_presets, cfg.region || cfgRegion.value, cfg.universe || cfgUniverse.value, cfg.delay != null ? cfg.delay : cfgDelay.value);
         } else {
@@ -834,11 +859,14 @@ HTML_PAGE = """<!doctype html>
         populateRegionOptions(cfg.supported_regions || [], cfg.region || "USA");
         cfgUniverse.value = cfg.universe || "";
         cfgDelay.value = String(cfg.delay != null ? cfg.delay : 1);
+        if (cfgRunnerMode) cfgRunnerMode.value = String(cfg.runner_mode || "oneclick");
         if (cfgConcurrencyProfile) cfgConcurrencyProfile.value = String(cfg.concurrency_profile || "advisor");
         if (cfgConcurrency) cfgConcurrency.value = String(cfg.concurrency != null ? cfg.concurrency : 56);
         if (cfgConcurrencyCap) cfgConcurrencyCap.value = String(cfg.concurrency_cap != null ? cfg.concurrency_cap : 0);
         if (cfgTemplateCount) cfgTemplateCount.value = String(cfg.template_count != null ? cfg.template_count : 64);
         if (cfgPollInterval) cfgPollInterval.value = String(cfg.poll_interval != null ? cfg.poll_interval : 10);
+        if (cfgProducerBatches) cfgProducerBatches.value = String(cfg.producer_loop_batches != null ? cfg.producer_loop_batches : 60);
+        if (cfgProducerSleep) cfgProducerSleep.value = String(cfg.producer_loop_sleep_sec != null ? cfg.producer_loop_sleep_sec : 1);
         populatePresetOptions(cfg.dataset_presets || [], cfg.region || "USA", cfg.universe || "", cfg.delay != null ? cfg.delay : 1);
         setManualDatasetIds(cfg.dataset_ids || []);
         setConfigState("配置已加载");
@@ -1461,6 +1489,13 @@ def _parse_int(value: str, default: int) -> int:
         return default
 
 
+def _parse_float(value: str, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
 SUPPORTED_REGIONS: List[str] = sorted(
     {
         "USA",
@@ -1817,6 +1852,14 @@ class FlowController:
         }
 
     def _read_config(self) -> Dict[str, Any]:
+        cfg_path = Path(self.config_path)
+        if not cfg_path.exists():
+            example = cfg_path.with_name("run_config.example.json")
+            if example.exists():
+                try:
+                    cfg_path.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+                except Exception:
+                    pass
         try:
             cfg = load_run_config(self.config_path)
         except Exception:
@@ -1831,7 +1874,11 @@ class FlowController:
         target.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _apply_paths_from_config(self, cfg: Dict[str, Any]) -> None:
-        output_dir = self.results_dir_override or _get(cfg, "output_dir", "results/one_click")
+        runner_mode = str(_get(cfg, "runner_mode", "oneclick")).strip().lower() or "oneclick"
+        if runner_mode == "produce_enqueue":
+            output_dir = self.results_dir_override or _get(cfg, "producer_output_dir", "results/producer")
+        else:
+            output_dir = self.results_dir_override or _get(cfg, "output_dir", "results/one_click")
         library_output = self.library_override or _get(cfg, "library_output", "templates/library.json")
         self.results_dir = output_dir
         self.library_path = library_output
@@ -1846,22 +1893,28 @@ class FlowController:
         delay = int(_get(cfg, "delay", 1))
         dataset_ids = _normalize_dataset_ids(_get(cfg, "dataset_ids", []))
         dataset_presets = _normalize_dataset_presets(_get(cfg, "dataset_presets", list(DEFAULT_DATASET_PRESETS)))
+        runner_mode = str(_get(cfg, "runner_mode", "oneclick")).strip().lower() or "oneclick"
         concurrency = max(1, int(_get(cfg, "concurrency", 56)))
         concurrency_cap = max(0, int(_get(cfg, "concurrency_cap", 0)))
         concurrency_profile = str(_get(cfg, "concurrency_profile", "advisor"))
         template_count = max(1, int(_get(cfg, "template_count", 64)))
         poll_interval = max(1, int(_get(cfg, "poll_interval", 10)))
+        producer_loop_batches = max(0, int(_get(cfg, "producer_loop_batches", 60)))
+        producer_loop_sleep_sec = max(0.0, float(_get(cfg, "producer_loop_sleep_sec", 1)))
         return {
             "region": region,
             "universe": universe,
             "delay": delay,
             "dataset_ids": dataset_ids,
             "dataset_presets": dataset_presets,
+            "runner_mode": runner_mode,
             "concurrency": concurrency,
             "concurrency_cap": concurrency_cap,
             "concurrency_profile": concurrency_profile,
             "template_count": template_count,
             "poll_interval": poll_interval,
+            "producer_loop_batches": producer_loop_batches,
+            "producer_loop_sleep_sec": producer_loop_sleep_sec,
             "config_path": self.config_path,
             "results_dir": self.results_dir,
             "library_path": self.library_path,
@@ -1883,22 +1936,36 @@ class FlowController:
             delay = max(0, delay)
             dataset_ids = _normalize_dataset_ids(payload.get("dataset_ids", _get(cfg, "dataset_ids", [])))
             dataset_presets = _normalize_dataset_presets(payload.get("dataset_presets", _get(cfg, "dataset_presets", list(DEFAULT_DATASET_PRESETS))))
+            runner_mode = str(payload.get("runner_mode", _get(cfg, "runner_mode", "oneclick"))).strip().lower() or "oneclick"
+            if runner_mode not in {"oneclick", "produce_enqueue"}:
+                runner_mode = "oneclick"
             concurrency = max(1, _parse_int(str(payload.get("concurrency", _get(cfg, "concurrency", 56))), int(_get(cfg, "concurrency", 56))))
             concurrency_cap = max(0, _parse_int(str(payload.get("concurrency_cap", _get(cfg, "concurrency_cap", 0))), int(_get(cfg, "concurrency_cap", 0))))
             concurrency_profile = str(payload.get("concurrency_profile", _get(cfg, "concurrency_profile", "advisor"))).strip() or "advisor"
             template_count = max(1, _parse_int(str(payload.get("template_count", _get(cfg, "template_count", 64))), int(_get(cfg, "template_count", 64))))
             poll_interval = max(1, _parse_int(str(payload.get("poll_interval", _get(cfg, "poll_interval", 10))), int(_get(cfg, "poll_interval", 10))))
+            producer_loop_batches = max(0, _parse_int(str(payload.get("producer_loop_batches", _get(cfg, "producer_loop_batches", 60))), int(_get(cfg, "producer_loop_batches", 60))))
+            producer_loop_sleep_sec = max(
+                0.0,
+                _parse_float(
+                    str(payload.get("producer_loop_sleep_sec", _get(cfg, "producer_loop_sleep_sec", 1))),
+                    float(_get(cfg, "producer_loop_sleep_sec", 1)),
+                ),
+            )
 
             cfg["region"] = region
             cfg["universe"] = universe
             cfg["delay"] = delay
             cfg["dataset_ids"] = dataset_ids
             cfg["dataset_presets"] = dataset_presets
+            cfg["runner_mode"] = runner_mode
             cfg["concurrency"] = concurrency
             cfg["concurrency_cap"] = concurrency_cap
             cfg["concurrency_profile"] = concurrency_profile
             cfg["template_count"] = template_count
             cfg["poll_interval"] = poll_interval
+            cfg["producer_loop_batches"] = producer_loop_batches
+            cfg["producer_loop_sleep_sec"] = producer_loop_sleep_sec
 
             self._write_config(cfg)
             self._apply_paths_from_config(cfg)
@@ -1909,11 +1976,14 @@ class FlowController:
             "delay": delay,
             "dataset_ids": dataset_ids,
             "dataset_presets": dataset_presets,
+            "runner_mode": runner_mode,
             "concurrency": concurrency,
             "concurrency_cap": concurrency_cap,
             "concurrency_profile": concurrency_profile,
             "template_count": template_count,
             "poll_interval": poll_interval,
+            "producer_loop_batches": producer_loop_batches,
+            "producer_loop_sleep_sec": producer_loop_sleep_sec,
             "supported_regions": SUPPORTED_REGIONS,
             "default_universe_map": dict(DEFAULT_UNIVERSE),
         }
@@ -2043,6 +2113,109 @@ class FlowController:
             self.stop_event.set()
             return "stop requested"
 
+    def _run_producer_enqueue(self, cfg: Dict[str, Any], progress_cb) -> Dict[str, Any]:
+        supabase_url = str(_get(cfg, "supabase_url", "") or os.getenv("SUPABASE_URL", "")).strip()
+        supabase_service_key = str(
+            _get(cfg, "supabase_service_role_key", "")
+            or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+        ).strip()
+        if not supabase_url or not supabase_service_key:
+            raise ValueError("produce_enqueue mode needs supabase_url and supabase_service_role_key")
+
+        loop_batches = max(0, int(_get(cfg, "producer_loop_batches", 60)))
+        loop_sleep_sec = max(0.0, _parse_float(str(_get(cfg, "producer_loop_sleep_sec", 1)), 1.0))
+        enqueue = bool(_get(cfg, "producer_enqueue", True))
+        if not enqueue:
+            raise ValueError("producer_enqueue must be true in produce_enqueue mode")
+
+        files: List[str] = []
+        total_count = 0
+        total_enqueued = 0
+        batch_idx = 0
+
+        while True:
+            if self.stop_event is not None and self.stop_event.is_set():
+                break
+            batch_idx += 1
+
+            summary = services.produce_templates_only(
+                region=_get(cfg, "region", "USA"),
+                universe=_get(cfg, "universe", ""),
+                delay=int(_get(cfg, "delay", 1)),
+                llm_config_path=_get(cfg, "llm_config", "llm.json"),
+                credentials_path=_get(cfg, "credentials", ""),
+                username=_get(cfg, "username", ""),
+                password=_get(cfg, "password", ""),
+                template_count=int(_get(cfg, "template_count", 64)),
+                style_prompt=_get(cfg, "style", ""),
+                inspiration=_get(cfg, "inspiration", ""),
+                timeout_sec=int(_get(cfg, "timeout_sec", 60)),
+                max_retries=int(_get(cfg, "max_retries", 5)),
+                disable_proxy=bool(_get(cfg, "disable_proxy", False)),
+                operator_file=_get(cfg, "operator_file", ""),
+                strict_validation=bool(_get(cfg, "strict_validation", False)),
+                max_operator_count=int(_get(cfg, "max_operator_count", 0)),
+                require_keyword_optional=bool(_get(cfg, "require_keyword_optional", True)),
+                batch_size=int(_get(cfg, "batch_size", 0)),
+                enforce_exact_batch=bool(_get(cfg, "enforce_exact_batch", False)),
+                required_theme_coverage=int(_get(cfg, "required_theme_coverage", 0)),
+                common_operator_limit=int(_get(cfg, "common_operator_limit", 0)),
+                enforce_explore_theme_pairs=bool(_get(cfg, "enforce_explore_theme_pairs", False)),
+                template_guide_path=_guide_path_value(cfg),
+                template_style_items=int(_get(cfg, "template_style_items", 0)),
+                template_seed_count=int(_get(cfg, "template_seed_count", 0)),
+                seed_templates=_get(cfg, "seed_templates", ""),
+                generate_inspiration=bool(_get(cfg, "generate_inspiration", False)),
+                ai_worker_file=_get(cfg, "ai_worker_file", "wqminer/constants/worker_prompt_compact.md"),
+                max_generate_attempts=int(_get(cfg, "max_generate_attempts", 4)),
+                dataset_ids=_get(cfg, "dataset_ids", []),
+                dataset_field_max_pages=int(_get(cfg, "dataset_field_max_pages", 5)),
+                dataset_field_page_limit=int(_get(cfg, "dataset_field_page_limit", 50)),
+                output_dir=self.results_dir,
+                enqueue=True,
+                queue_job_table=str(_get(cfg, "queue_job_table", "alpha_jobs")),
+                supabase_url=supabase_url,
+                supabase_service_key=supabase_service_key,
+            )
+
+            file_path = str(summary.get("output_file", "")).strip()
+            if file_path:
+                files.append(file_path)
+            count = int(summary.get("count", 0))
+            enq = int(summary.get("enqueued_count", 0))
+            total_count += count
+            total_enqueued += enq
+
+            if progress_cb:
+                progress_cb(
+                    {
+                        "stage": "produce_enqueue",
+                        "round": batch_idx,
+                        "total": loop_batches if loop_batches > 0 else 0,
+                        "completed": batch_idx,
+                        "success": total_enqueued,
+                        "failed": max(0, total_count - total_enqueued),
+                        "last": {
+                            "output_file": file_path,
+                            "count": count,
+                            "enqueued_count": enq,
+                        },
+                    }
+                )
+
+            if loop_batches > 0 and batch_idx >= loop_batches:
+                break
+            if loop_sleep_sec > 0:
+                time.sleep(loop_sleep_sec)
+
+        return {
+            "mode": "produce_enqueue",
+            "files": files,
+            "batches": batch_idx,
+            "count": total_count,
+            "enqueued_count": total_enqueued,
+        }
+
     def _run(self) -> None:
         try:
             cfg = self._read_config()
@@ -2056,63 +2229,70 @@ class FlowController:
                     return
                 self.update_progress(**payload)
 
-            summary = services.run_one_click(
-                region=_get(cfg, "region", "USA"),
-                universe=_get(cfg, "universe", ""),
-                delay=int(_get(cfg, "delay", 1)),
-                llm_config_path=_get(cfg, "llm_config", "llm.json"),
-                credentials_path=_get(cfg, "credentials", ""),
-                username=_get(cfg, "username", ""),
-                password=_get(cfg, "password", ""),
-                template_count=int(_get(cfg, "template_count", 64)),
-                style_prompt=_get(cfg, "style", ""),
-                inspiration=_get(cfg, "inspiration", ""),
-                output_dir=output_dir,
-                concurrency=int(_get(cfg, "concurrency", 56)),
-                concurrency_profile=str(_get(cfg, "concurrency_profile", "advisor")),
-                async_mode=bool(_get(cfg, "async_mode", False)),
-                timeout_sec=int(_get(cfg, "timeout_sec", 60)),
-                max_retries=int(_get(cfg, "max_retries", 5)),
-                poll_interval_sec=int(_get(cfg, "poll_interval", 10)),
-                max_wait_sec=int(_get(cfg, "max_wait", 600)),
-                max_rounds=int(_get(cfg, "max_rounds", 0)),
-                sleep_between_rounds=int(_get(cfg, "sleep_between_rounds", 5)),
-                evolve_rounds=int(_get(cfg, "evolve_rounds", 0)),
-                evolve_count=int(_get(cfg, "evolve_count", 0)),
-                evolve_top_k=int(_get(cfg, "evolve_top_k", 6)),
-                concurrency_cap=int(_get(cfg, "concurrency_cap", 0)),
-                seed_templates=_get(cfg, "seed_templates", ""),
-                library_output=library_output,
-                library_sharpe_min=float(_get(cfg, "library_sharpe_min", 1.2)),
-                library_fitness_min=float(_get(cfg, "library_fitness_min", 1.0)),
-                reverse_sharpe_max=float(_get(cfg, "reverse_sharpe_max", -1.2)),
-                reverse_fitness_max=float(_get(cfg, "reverse_fitness_max", -1.0)),
-                reverse_log=_get(cfg, "reverse_log", ""),
-                negate_max_per_round=int(_get(cfg, "negate_max_per_round", 0)),
-                retry_failed_rounds=int(_get(cfg, "retry_failed_rounds", 2)),
-                retry_failed_sleep=int(_get(cfg, "retry_failed_sleep", 2)),
-                disable_proxy=bool(_get(cfg, "disable_proxy", False)),
-                notify_url=_get(cfg, "notify_url", ""),
-                operator_file=_get(cfg, "operator_file", ""),
-                strict_validation=bool(_get(cfg, "strict_validation", False)),
-                max_operator_count=int(_get(cfg, "max_operator_count", 0)),
-                require_keyword_optional=bool(_get(cfg, "require_keyword_optional", True)),
-                batch_size=int(_get(cfg, "batch_size", 0)),
-                enforce_exact_batch=bool(_get(cfg, "enforce_exact_batch", False)),
-                required_theme_coverage=int(_get(cfg, "required_theme_coverage", 0)),
-                common_operator_limit=int(_get(cfg, "common_operator_limit", 0)),
-                enforce_explore_theme_pairs=bool(_get(cfg, "enforce_explore_theme_pairs", False)),
-                template_guide_path=_guide_path_value(cfg),
-                template_style_items=int(_get(cfg, "template_style_items", 0)),
-                template_seed_count=int(_get(cfg, "template_seed_count", 0)),
-                dataset_ids=_get(cfg, "dataset_ids", []),
-                dataset_field_max_pages=int(_get(cfg, "dataset_field_max_pages", 5)),
-                dataset_field_page_limit=int(_get(cfg, "dataset_field_page_limit", 50)),
-                results_append_file=_get(cfg, "results_append_file", ""),
-                baseline_alpha_id=_get(cfg, "baseline_alpha_id", ""),
-                progress_cb=progress_cb,
-                stop_event=self.stop_event,
-            )
+            runner_mode = str(_get(cfg, "runner_mode", "oneclick")).strip().lower() or "oneclick"
+            if runner_mode == "produce_enqueue":
+                summary = self._run_producer_enqueue(cfg, progress_cb)
+            else:
+                summary = services.run_one_click(
+                    region=_get(cfg, "region", "USA"),
+                    universe=_get(cfg, "universe", ""),
+                    delay=int(_get(cfg, "delay", 1)),
+                    llm_config_path=_get(cfg, "llm_config", "llm.json"),
+                    credentials_path=_get(cfg, "credentials", ""),
+                    username=_get(cfg, "username", ""),
+                    password=_get(cfg, "password", ""),
+                    template_count=int(_get(cfg, "template_count", 64)),
+                    style_prompt=_get(cfg, "style", ""),
+                    inspiration=_get(cfg, "inspiration", ""),
+                    output_dir=output_dir,
+                    concurrency=int(_get(cfg, "concurrency", 56)),
+                    concurrency_profile=str(_get(cfg, "concurrency_profile", "advisor")),
+                    async_mode=bool(_get(cfg, "async_mode", False)),
+                    timeout_sec=int(_get(cfg, "timeout_sec", 60)),
+                    max_retries=int(_get(cfg, "max_retries", 5)),
+                    poll_interval_sec=int(_get(cfg, "poll_interval", 10)),
+                    max_wait_sec=int(_get(cfg, "max_wait", 600)),
+                    max_rounds=int(_get(cfg, "max_rounds", 0)),
+                    sleep_between_rounds=int(_get(cfg, "sleep_between_rounds", 5)),
+                    evolve_rounds=int(_get(cfg, "evolve_rounds", 0)),
+                    evolve_count=int(_get(cfg, "evolve_count", 0)),
+                    evolve_top_k=int(_get(cfg, "evolve_top_k", 6)),
+                    concurrency_cap=int(_get(cfg, "concurrency_cap", 0)),
+                    seed_templates=_get(cfg, "seed_templates", ""),
+                    library_output=library_output,
+                    library_sharpe_min=float(_get(cfg, "library_sharpe_min", 1.2)),
+                    library_fitness_min=float(_get(cfg, "library_fitness_min", 1.0)),
+                    reverse_sharpe_max=float(_get(cfg, "reverse_sharpe_max", -1.2)),
+                    reverse_fitness_max=float(_get(cfg, "reverse_fitness_max", -1.0)),
+                    reverse_log=_get(cfg, "reverse_log", ""),
+                    negate_max_per_round=int(_get(cfg, "negate_max_per_round", 0)),
+                    retry_failed_rounds=int(_get(cfg, "retry_failed_rounds", 2)),
+                    retry_failed_sleep=int(_get(cfg, "retry_failed_sleep", 2)),
+                    disable_proxy=bool(_get(cfg, "disable_proxy", False)),
+                    notify_url=_get(cfg, "notify_url", ""),
+                    operator_file=_get(cfg, "operator_file", ""),
+                    strict_validation=bool(_get(cfg, "strict_validation", False)),
+                    max_operator_count=int(_get(cfg, "max_operator_count", 0)),
+                    require_keyword_optional=bool(_get(cfg, "require_keyword_optional", True)),
+                    batch_size=int(_get(cfg, "batch_size", 0)),
+                    enforce_exact_batch=bool(_get(cfg, "enforce_exact_batch", False)),
+                    required_theme_coverage=int(_get(cfg, "required_theme_coverage", 0)),
+                    common_operator_limit=int(_get(cfg, "common_operator_limit", 0)),
+                    enforce_explore_theme_pairs=bool(_get(cfg, "enforce_explore_theme_pairs", False)),
+                    template_guide_path=_guide_path_value(cfg),
+                    template_style_items=int(_get(cfg, "template_style_items", 0)),
+                    template_seed_count=int(_get(cfg, "template_seed_count", 0)),
+                    generate_inspiration=bool(_get(cfg, "generate_inspiration", False)),
+                    ai_worker_file=_get(cfg, "ai_worker_file", "wqminer/constants/worker_prompt_compact.md"),
+                    max_generate_attempts=int(_get(cfg, "max_generate_attempts", 4)),
+                    dataset_ids=_get(cfg, "dataset_ids", []),
+                    dataset_field_max_pages=int(_get(cfg, "dataset_field_max_pages", 5)),
+                    dataset_field_page_limit=int(_get(cfg, "dataset_field_page_limit", 50)),
+                    results_append_file=_get(cfg, "results_append_file", ""),
+                    baseline_alpha_id=_get(cfg, "baseline_alpha_id", ""),
+                    progress_cb=progress_cb,
+                    stop_event=self.stop_event,
+                )
             self.last_summary = summary
         except Exception as exc:
             self.last_error = str(exc)

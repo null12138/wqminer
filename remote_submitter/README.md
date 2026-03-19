@@ -14,6 +14,14 @@ cargo build --release
 
 Prebuilt binary in this repo:
 - `bin/remote_submitter_arm64` (macOS arm64 / Apple Silicon)
+- `bin/remote_submitter_linux_arm64` (Linux arm64, musl/static)
+
+For Raspberry Pi (Linux arm64), build on target host:
+```bash
+cd remote_submitter
+cargo build --release
+./target/release/remote_submitter
+```
 
 ## Configure
 ```bash
@@ -39,9 +47,9 @@ cargo run --release
 ```
 
 ## Job lifecycle
-- claim: `queued/retry` -> `in_progress` (`created_at` old -> new)
-- success: `simulated` or `submitted` (if `AUTO_SUBMIT=true`)
-- failure: `retry` until `attempts >= max_attempts`, then `failed`
+- claim: `queued` -> `in_progress` (`created_at` old -> new)
+- success: `success` (with `submitted=true/false`)
+- failure: `failed`
 
 Scheduler model:
 - continuous refill loop keeps slots saturated up to `CONCURRENCY`

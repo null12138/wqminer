@@ -21,6 +21,7 @@ class TemplateGenerator:
         data_fields: List[DataField],
         count: int,
         style_prompt: str = "",
+        policy_prompt: str = "",
         max_prompt_operators: int = 24,
         max_prompt_fields: int = 30,
     ) -> List[TemplateCandidate]:
@@ -40,23 +41,28 @@ class TemplateGenerator:
 
         field_lines = [f"- {f.field_id}: {f.description or 'no description'}" for f in sampled_fields]
 
+        compact_style = self._truncate(style_prompt, 1800)
+        compact_policy = self._truncate(policy_prompt, 1800)
+
         system_prompt = (
-            "You are a WorldQuant Brain FASTEXPR specialist. "
-            "Output ONLY valid FASTEXPR expressions, one per line. "
-            "No numbering, no markdown, no extra text."
+            "You are an execution-focused WorldQuant BRAIN FASTEXPR worker. "
+            "Prioritize throughput and validity first. "
+            "Output ONLY valid FASTEXPR expressions, one per line, no markdown."
         )
 
         user_prompt = (
             f"Region: {region}\n"
             f"Task: Generate exactly {count} diverse FASTEXPR alpha expressions.\n"
-            "Hard constraints:\n"
+            "Hard constraints (must obey):\n"
             "- Use ONLY the operators listed below (names must match exactly).\n"
             "- Use ONLY the field IDs listed below (spelling must match exactly).\n"
             "- Each line must be a complete, balanced expression.\n"
             "- Avoid undefined identifiers and avoid empty/constant-only expressions.\n"
             "- Keep each expression under 200 characters.\n"
-            f"- If style requirements conflict with the constraints, ignore them.\n"
-            f"Style requirements: {style_prompt or 'none'}\n\n"
+            "- If any style/policy conflicts with hard constraints, follow hard constraints.\n"
+            "- Prefer economically sensible and stable, neutralizable structures over noisy hacks.\n"
+            f"Policy guidance:\n{compact_policy or 'none'}\n"
+            f"Style requirements:\n{compact_style or 'none'}\n\n"
             "Operators:\n"
             + "\n".join(operator_lines)
             + "\n\nData fields:\n"
@@ -147,3 +153,10 @@ class TemplateGenerator:
                 if depth < 0:
                     return False
         return depth == 0
+
+    @staticmethod
+    def _truncate(text: str, limit: int) -> str:
+        raw = (text or "").strip()
+        if limit <= 0 or len(raw) <= limit:
+            return raw
+        return raw[:limit].rstrip()

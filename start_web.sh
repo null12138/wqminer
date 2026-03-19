@@ -11,6 +11,15 @@ RESULTS_DIR="${RESULTS_DIR:-}"
 LIBRARY="${LIBRARY:-}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8002}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+
+if [[ -z "$PYTHON_BIN" ]]; then
+  if command -v python3.12 >/dev/null 2>&1; then
+    PYTHON_BIN="python3.12"
+  else
+    PYTHON_BIN="python3"
+  fi
+fi
 
 args=()
 if [[ -n "$RESULTS_DIR" ]]; then
@@ -20,7 +29,7 @@ if [[ -n "$LIBRARY" ]]; then
   args+=(--library "$LIBRARY")
 fi
 
-cmd=(python3 "$ROOT/web_query.py" --config "$CONFIG")
+cmd=("$PYTHON_BIN" "$ROOT/web_query.py" --config "$CONFIG")
 if ((${#args[@]})); then
   cmd+=("${args[@]}")
 fi

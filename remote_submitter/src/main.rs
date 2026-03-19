@@ -68,7 +68,6 @@ struct JobRow {
     neutralization: String,
     language: String,
     attempts: i32,
-    max_attempts: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -376,8 +375,7 @@ async fn claim_jobs(pool: &PgPool, fetch_size: i64, worker_id: &str) -> Result<V
 with picked as (
   select id
   from public.alpha_jobs
-  where status in ('queued', 'retry')
-    and attempts < max_attempts
+  where status = 'queued'
   order by created_at asc, id asc
   limit $1
   for update skip locked
@@ -399,8 +397,7 @@ returning
   j.delay,
   j.neutralization,
   j.language,
-  j.attempts,
-  j.max_attempts
+  j.attempts
 "#;
     let rows = sqlx::query_as::<_, JobRow>(sql)
         .bind(fetch_size)
@@ -412,19 +409,18 @@ returning
 }
 
 async fn mark_success(pool: &PgPool, job_id: i64, outcome: &JobOutcome) -> Result<()> {
-    let status = if outcome.submitted { "submitted" } else { "simulated" };
     sqlx::query(
         r#"
 update public.alpha_jobs
-set status = $2,
-    alpha_id = $3,
-    link = $4,
-    sharpe = $5,
-    fitness = $6,
-    turnover = $7,
-    submitted = $8,
+set status = 'success',
+    alpha_id = $2,
+    link = $3,
+    sharpe = $4,
+    fitness = $5,
+    turnover = $6,
+    submitted = $7,
     error_message = null,
-    last_response = $9,
+    last_response = $8,
     locked_by = null,
     locked_at = null,
     updated_at = timezone('utc', now())
@@ -432,7 +428,6 @@ where id = $1
 "#,
     )
     .bind(job_id)
-    .bind(status)
     .bind(&outcome.alpha_id)
     .bind(&outcome.link)
     .bind(outcome.sharpe)
@@ -447,17 +442,14 @@ where id = $1
 }
 
 async fn mark_failure(pool: &PgPool, job: &JobRow, message: &str) -> Result<()> {
-    let terminal = job.attempts >= job.max_attempts;
-    let status = if terminal { "failed" } else { "retry" };
     sqlx::query(
         r#"
 update public.alpha_jobs
-set status = $2,
-    error_message = $3,
+set status = 'failed',
+    error_message = $2,
     last_response = jsonb_build_object(
-      'error', $3,
-      'attempts', $4,
-      'max_attempts', $5
+      'error', $2,
+      'attempts', $3
     ),
     locked_by = null,
     locked_at = null,
@@ -466,10 +458,8 @@ where id = $1
 "#,
     )
     .bind(job.id)
-    .bind(status)
     .bind(message)
     .bind(job.attempts)
-    .bind(job.max_attempts)
     .execute(pool)
     .await
     .context("mark_failure update failed")?;

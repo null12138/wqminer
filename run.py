@@ -27,8 +27,6 @@ def parse_args():
         default="",
         help="Supabase service role key (or SUPABASE_SERVICE_ROLE_KEY env)",
     )
-    parser.add_argument("--queue-priority", type=int, default=0, help="Only for --mode produce")
-    parser.add_argument("--queue-max-attempts", type=int, default=6, help="Only for --mode produce")
     parser.add_argument("--log-level", default="INFO", help="DEBUG/INFO/WARNING/ERROR")
     return parser.parse_args()
 
@@ -91,14 +89,14 @@ def _run_produce(args, cfg: dict) -> dict:
         template_style_items=int(_get(cfg, "template_style_items", 0)),
         template_seed_count=int(_get(cfg, "template_seed_count", 0)),
         seed_templates=_get(cfg, "seed_templates", ""),
+        generate_inspiration=bool(_get(cfg, "generate_inspiration", False)),
+        ai_worker_file=_get(cfg, "ai_worker_file", "wqminer/constants/worker_prompt_compact.md"),
+        max_generate_attempts=int(_get(cfg, "max_generate_attempts", 4)),
         dataset_ids=_get(cfg, "dataset_ids", []),
         dataset_field_max_pages=int(_get(cfg, "dataset_field_max_pages", 5)),
         dataset_field_page_limit=int(_get(cfg, "dataset_field_page_limit", 50)),
         output_dir=output_dir,
         enqueue=bool(args.enqueue),
-        queue_priority=int(args.queue_priority),
-        queue_max_attempts=int(args.queue_max_attempts),
-        queue_batch_table=str(_get(cfg, "queue_batch_table", "alpha_batches")),
         queue_job_table=str(_get(cfg, "queue_job_table", "alpha_jobs")),
         supabase_url=supabase_url,
         supabase_service_key=supabase_service_key,
@@ -106,7 +104,6 @@ def _run_produce(args, cfg: dict) -> dict:
     print(f"output_file={summary.get('output_file', '')}")
     print(f"count={summary.get('count', 0)}")
     print(f"enqueued_count={summary.get('enqueued_count', 0)}")
-    print(f"queue_batch_id={summary.get('queue_batch_id', '')}")
     return summary
 
 
@@ -162,6 +159,9 @@ def _run_oneclick(args, cfg: dict) -> dict:
         template_guide_path=_guide_path_value(cfg),
         template_style_items=int(_get(cfg, "template_style_items", 0)),
         template_seed_count=int(_get(cfg, "template_seed_count", 0)),
+        generate_inspiration=bool(_get(cfg, "generate_inspiration", False)),
+        ai_worker_file=_get(cfg, "ai_worker_file", "wqminer/constants/worker_prompt_compact.md"),
+        max_generate_attempts=int(_get(cfg, "max_generate_attempts", 4)),
         dataset_ids=_get(cfg, "dataset_ids", []),
         dataset_field_max_pages=int(_get(cfg, "dataset_field_max_pages", 5)),
         dataset_field_page_limit=int(_get(cfg, "dataset_field_page_limit", 50)),
