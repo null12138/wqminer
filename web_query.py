@@ -599,7 +599,7 @@ HTML_PAGE = """<!doctype html>
     }
 
     function splitDatasetIds(raw) {
-      const source = Array.isArray(raw) ? raw.join("\n") : String(raw || "");
+      const source = Array.isArray(raw) ? raw.join("\\n") : String(raw || "");
       const parts = source.split(/[\\s,;|]+/g);
       const out = [];
       const seen = new Set();
@@ -635,7 +635,7 @@ HTML_PAGE = """<!doctype html>
 
     function setManualDatasetIds(ids) {
       if (!cfgDatasetsManual) return;
-      cfgDatasetsManual.value = splitDatasetIds(ids).join("\n");
+      cfgDatasetsManual.value = splitDatasetIds(ids).join("\\n");
     }
 
     function setSelectedDatasetIds(ids) {
