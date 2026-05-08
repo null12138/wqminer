@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.venv/
+.venv*/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local configs / secrets
+credentials.json
+llm.json
+llm.*.json
+run_config.json
+*.key
+*.pem
+
+# Outputs / caches
+results/
+data/cache/
+logs/
+
+# Template libraries (track only the curated library)
+templates/*.json
+!templates/library.json
+
+# Bundles / build
+build/
+dist/
+target/
+remote_submitter/target/
+remote_submitter/.env
+
+# Playwright
+*.har
+*.trace
