@@ -11,7 +11,7 @@ WQMiner 是一个 alpha 因子挖掘工具。
 如需获取 BrainAPI 访问权限，请按以下步骤操作：
 
 1. 点击 GitHub 仓库右上角的 ⭐ **Star**
-2. 发送邮件至 [opener@opener.eu.org](mailto:opener@opener.eu.org)，邮件标题请注明 "WQMiner BrainAPI Access Request"，并附上您的 GitHub 用户名
+2. 发送邮件至 [ryc_null@outlook.com](mailto:ryc_null@outlook.com)，邮件标题请注明 "WQMiner BrainAPI Access Request"，并附上您的 GitHub 用户名
 3. 我们将会审核您的 Star 记录，通过邮件回复您 BrainAPI 的配置信息
 
 ## 快速开始
